@@ -1,0 +1,2775 @@
+using System;
+using System.Collections.Generic;
+using System.Data.SQLite;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Telegram.Bot;
+using Telegram.Bot.Polling;
+using Telegram.Bot.Types;
+using Telegram.Bot.Types.Enums;
+using Telegram.Bot.Types.ReplyMarkups;
+
+namespace InvestmentBot
+{
+    class Program
+    {
+        #region Constants and Fields
+
+        private const string BotToken = "8306720947:AAHKnXBWxuRT5uWVQQO6R6mcxeFnMxsFrsY";
+        private static readonly long[] AdminIds = { 1800817933 };
+        private static readonly TimeSpan InterestInterval = TimeSpan.FromDays(7);
+        private static readonly ITelegramBotClient BotClient = new TelegramBotClient(BotToken);
+        private static readonly SQLiteConnection DbConnection = new SQLiteConnection("Data Source=investments.db;Version=3;");
+        private static readonly System.Timers.Timer InterestTimer = new System.Timers.Timer(InterestInterval.TotalMilliseconds);
+        private static readonly Dictionary<long, string> UserStates = new Dictionary<long, string>();
+        private static readonly Dictionary<long, int> LastMessageIds = new Dictionary<long, int>();
+        private static readonly Dictionary<long, (string Data, DateTime Timestamp)> LastCallbackData =
+    new Dictionary<long, (string Data, DateTime Timestamp)>();
+
+        #endregion
+
+        #region Data Models
+
+        public class Deposit
+        {
+            public int Id { get; set; }
+            public long UserId { get; set; }
+            public string Username { get; set; }
+            public decimal Amount { get; set; }
+            public DateTime Date { get; set; }
+            public string Status { get; set; }
+        }
+
+        public class Withdrawal
+        {
+            public int Id { get; set; }
+            public long UserId { get; set; }
+            public string Username { get; set; }
+            public decimal Amount { get; set; }
+            public DateTime Date { get; set; }
+            public string Status { get; set; }
+        }
+
+        public class Requisite
+        {
+            public int Id { get; set; }
+            public string Type { get; set; }
+            public string BankOrCoin { get; set; }
+            public string Details { get; set; }
+            public DateTime DateAdded { get; set; }
+        }
+
+        #endregion
+
+        #region Program Initialization
+
+        static Program()
+        {
+            InterestTimer.Elapsed += async (sender, e) => await CalculateInterestAsync();
+            InterestTimer.AutoReset = true;
+        }
+
+        static async Task Main(string[] args)
+        {
+            try
+            {
+                await DbConnection.OpenAsync();
+                await InitializeDatabaseAsync();
+                InterestTimer.Start();
+
+                var cts = new CancellationTokenSource();
+                var receiverOptions = new ReceiverOptions { AllowedUpdates = { } };
+                BotClient.StartReceiving(HandleUpdateAsync, HandleErrorAsync, receiverOptions, cts.Token);
+
+                Console.WriteLine("Бот FAST INVEST запущен. Нажмите любую клавишу для выхода.");
+                Console.ReadKey();
+
+                cts.Cancel();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка запуска бота: {ex}");
+            }
+            finally
+            {
+                await DbConnection.CloseAsync();
+            }
+        }
+
+        #endregion
+
+        #region Database Methods
+
+        private static async Task InitializeDatabaseAsync()
+        {
+            string[] queries = {
+        @"CREATE TABLE IF NOT EXISTS Users (
+            TelegramId INTEGER PRIMARY KEY,
+            Username TEXT,
+            Deposit REAL DEFAULT 0,
+            Interest REAL DEFAULT 0,
+            Status TEXT DEFAULT 'Новичок',
+            ReferralCode TEXT,
+            ReferralCount INTEGER DEFAULT 0,
+            IsBlocked INTEGER DEFAULT 0
+        )",
+        @"CREATE TABLE IF NOT EXISTS Deposits (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            TelegramId INTEGER,
+            Amount REAL,
+            Date TEXT,
+            Status TEXT DEFAULT 'Ожидает'
+        )",
+        @"CREATE TABLE IF NOT EXISTS Withdrawals (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            TelegramId INTEGER,
+            Amount REAL,
+            Date TEXT,
+            Status TEXT DEFAULT 'Ожидает'
+        )",
+        @"CREATE TABLE IF NOT EXISTS Referrals (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ReferrerId INTEGER,
+            RefereeId INTEGER,
+            Bonus REAL,
+            Date TEXT
+        )",
+        @"CREATE TABLE IF NOT EXISTS Requisites (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            Type TEXT,
+            BankOrCoin TEXT,
+            Details TEXT,
+            DateAdded TEXT
+        )",
+        @"CREATE TABLE IF NOT EXISTS DepositProofs (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            TelegramId INTEGER,
+            DepositId INTEGER,
+            FileId TEXT,
+            FileType TEXT,
+            Date TEXT,
+            Status TEXT DEFAULT 'Ожидает',
+            FOREIGN KEY(DepositId) REFERENCES Deposits(Id)
+        )"
+    };
+
+            foreach (var query in queries)
+            {
+                using var cmd = new SQLiteCommand(query, DbConnection);
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            // Проверяем и добавляем колонку DepositId если её нет
+            using var checkColumnCmd = new SQLiteCommand(
+                "PRAGMA table_info(DepositProofs)", DbConnection);
+            using var reader = await checkColumnCmd.ExecuteReaderAsync();
+
+            bool hasDepositId = false;
+            while (await reader.ReadAsync())
+            {
+                if (reader.GetString(1) == "DepositId")
+                {
+                    hasDepositId = true;
+                    break;
+                }
+            }
+
+            if (!hasDepositId)
+            {
+                using var alterCmd = new SQLiteCommand(
+                    "ALTER TABLE DepositProofs ADD COLUMN DepositId INTEGER", DbConnection);
+                await alterCmd.ExecuteNonQueryAsync();
+            }
+
+            // Проверяем и добавляем колонку IsBlocked если её нет
+            using var checkBlockedColumnCmd = new SQLiteCommand(
+                "PRAGMA table_info(Users)", DbConnection);
+            using var blockedReader = await checkBlockedColumnCmd.ExecuteReaderAsync();
+
+            bool hasBlockedColumn = false;
+            while (await blockedReader.ReadAsync())
+            {
+                if (blockedReader.GetString(1) == "IsBlocked")
+                {
+                    hasBlockedColumn = true;
+                    break;
+                }
+            }
+
+            if (!hasBlockedColumn)
+            {
+                using var alterBlockedCmd = new SQLiteCommand(
+                    "ALTER TABLE Users ADD COLUMN IsBlocked INTEGER DEFAULT 0", DbConnection);
+                await alterBlockedCmd.ExecuteNonQueryAsync();
+            }
+        }
+
+        private static async Task RegisterUserAsync(long chatId, string username)
+        {
+            using var checkCmd = new SQLiteCommand("SELECT COUNT(*) FROM Users WHERE TelegramId = @id", DbConnection);
+            checkCmd.Parameters.AddWithValue("@id", chatId);
+            var exists = (long)await checkCmd.ExecuteScalarAsync() > 0;
+
+            if (!exists)
+            {
+                string referralCode;
+                do
+                {
+                    referralCode = Guid.NewGuid().ToString().Substring(0, 8);
+                    using var codeCheckCmd = new SQLiteCommand("SELECT COUNT(*) FROM Users WHERE ReferralCode = @code", DbConnection);
+                    codeCheckCmd.Parameters.AddWithValue("@code", referralCode);
+                    var codeExists = (long)await codeCheckCmd.ExecuteScalarAsync() > 0;
+                    if (!codeExists) break;
+                } while (true);
+
+                using var cmd = new SQLiteCommand(
+                    "INSERT INTO Users (TelegramId, Username, ReferralCode) VALUES (@id, @username, @code)", DbConnection);
+                cmd.Parameters.AddWithValue("@id", chatId);
+                cmd.Parameters.AddWithValue("@username", username);
+                cmd.Parameters.AddWithValue("@code", referralCode);
+                await cmd.ExecuteNonQueryAsync();
+            }
+            else
+            {
+                await UpdateUsernameAsync(chatId, username);
+            }
+        }
+        private static async Task UpdateUserStatusAsync(long telegramId)
+        {
+            try
+            {
+                // Получаем сумму депозита
+                decimal totalDeposit = 0;
+                using (var cmd = new SQLiteCommand(
+                    "SELECT SUM(Amount) FROM Deposits WHERE TelegramId = @id AND Status = 'Подтверждён'",
+                    DbConnection))
+                {
+                    cmd.Parameters.AddWithValue("@id", telegramId);
+                    var result = await cmd.ExecuteScalarAsync();
+                    totalDeposit = result is DBNull ? 0 : Convert.ToDecimal(result);
+                }
+
+                // Получаем количество рефералов
+                int referralCount = 0;
+                using (var cmd = new SQLiteCommand(
+                    "SELECT COUNT(*) FROM Referrals WHERE ReferrerId = @id",
+                    DbConnection))
+                {
+                    cmd.Parameters.AddWithValue("@id", telegramId);
+                    referralCount = Convert.ToInt32(await cmd.ExecuteScalarAsync());
+                }
+
+                // Определяем статус
+                string status;
+                if (totalDeposit >= 100000 && referralCount >= 10)
+                {
+                    status = "Кит";
+                }
+                else if (totalDeposit >= 50000 || referralCount >= 5)
+                {
+                    status = "Профи";
+                }
+                else
+                {
+                    status = "Новичок";
+                }
+
+                // Обновляем статус в базе
+                using (var cmd = new SQLiteCommand(
+                    "UPDATE Users SET Status = @status WHERE TelegramId = @id",
+                    DbConnection))
+                {
+                    cmd.Parameters.AddWithValue("@status", status);
+                    cmd.Parameters.AddWithValue("@id", telegramId);
+                    await cmd.ExecuteNonQueryAsync();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка обновления статуса для {telegramId}: {ex}");
+            }
+        }
+        private static async Task UpdateUsernameAsync(long chatId, string username)
+        {
+            using var cmd = new SQLiteCommand(
+                "UPDATE Users SET Username = @username WHERE TelegramId = @id", DbConnection);
+            cmd.Parameters.AddWithValue("@username", username);
+            cmd.Parameters.AddWithValue("@id", chatId);
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        private static async Task<string> GetReferralCodeAsync(long chatId)
+        {
+            using var cmd = new SQLiteCommand("SELECT ReferralCode FROM Users WHERE TelegramId = @id", DbConnection);
+            cmd.Parameters.AddWithValue("@id", chatId);
+            var result = await cmd.ExecuteScalarAsync();
+            return result?.ToString() ?? string.Empty;
+        }
+
+        private static async Task<string> GetUsernameAsync(long chatId)
+        {
+            using var cmd = new SQLiteCommand("SELECT Username FROM Users WHERE TelegramId = @id", DbConnection);
+            cmd.Parameters.AddWithValue("@id", chatId);
+            var result = await cmd.ExecuteScalarAsync();
+            return result?.ToString() ?? "Не указан";
+        }
+
+        private static async Task<int> GetReferralCountAsync(long telegramId)
+        {
+            try
+            {
+                using var cmd = new SQLiteCommand(
+                    "SELECT COUNT(*) FROM Referrals WHERE ReferrerId = @id",
+                    DbConnection);
+                cmd.Parameters.AddWithValue("@id", telegramId);
+                var result = await cmd.ExecuteScalarAsync();
+                return Convert.ToInt32(result);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка получения количества рефералов для {telegramId}: {ex}");
+                return 0;
+            }
+        }
+
+        private static async Task<(decimal deposit, decimal interest, string status)> GetUserInfoAsync(long chatId)
+        {
+            using var cmd = new SQLiteCommand(
+                "SELECT Deposit, Interest, Status FROM Users WHERE TelegramId = @id", DbConnection);
+            cmd.Parameters.AddWithValue("@id", chatId);
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (await reader.ReadAsync())
+            {
+                return (reader.GetDecimal(0), reader.GetDecimal(1), reader.GetString(2));
+            }
+            return (0, 0, "Новичок");
+        }
+
+        private static async Task<DateTime?> GetLastDepositDateAsync(long chatId)
+        {
+            using var cmd = new SQLiteCommand(
+                "SELECT Date FROM Deposits WHERE TelegramId = @id AND Status = 'Подтверждён' ORDER BY Date DESC LIMIT 1",
+                DbConnection);
+            cmd.Parameters.AddWithValue("@id", chatId);
+            var result = await cmd.ExecuteScalarAsync();
+            return result != null ? DateTime.Parse(result.ToString()) : (DateTime?)null;
+        }
+
+        private static async Task<Requisite> GetRequisiteByIdAsync(int id)
+        {
+            using var cmd = new SQLiteCommand("SELECT * FROM Requisites WHERE Id = @id", DbConnection);
+            cmd.Parameters.AddWithValue("@id", id);
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (await reader.ReadAsync())
+            {
+                return new Requisite
+                {
+                    Id = reader.GetInt32(0),
+                    Type = reader.GetString(1),
+                    BankOrCoin = reader.GetString(2),
+                    Details = reader.GetString(3),
+                    DateAdded = DateTime.Parse(reader.GetString(4))
+                };
+            }
+            return null;
+        }
+
+        private static async Task<List<Requisite>> GetAllRequisitesAsync()
+        {
+            var requisites = new List<Requisite>();
+            using var cmd = new SQLiteCommand("SELECT * FROM Requisites ORDER BY DateAdded DESC", DbConnection);
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                requisites.Add(new Requisite
+                {
+                    Id = reader.GetInt32(0),
+                    Type = reader.GetString(1),
+                    BankOrCoin = reader.GetString(2),
+                    Details = reader.GetString(3),
+                    DateAdded = DateTime.Parse(reader.GetString(4))
+                });
+            }
+            return requisites;
+        }
+
+        private static async Task<Deposit> GetDepositByIdAsync(int id)
+        {
+            using var cmd = new SQLiteCommand(
+                "SELECT d.Id, d.TelegramId, u.Username, d.Amount, d.Date, d.Status " +
+                "FROM Deposits d LEFT JOIN Users u ON d.TelegramId = u.TelegramId " +
+                "WHERE d.Id = @id", DbConnection);
+            cmd.Parameters.AddWithValue("@id", id);
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (await reader.ReadAsync())
+            {
+                return new Deposit
+                {
+                    Id = reader.GetInt32(0),
+                    UserId = reader.GetInt64(1),
+                    Username = reader.IsDBNull(2) ? "N/A" : reader.GetString(2),
+                    Amount = reader.GetDecimal(3),
+                    Date = DateTime.Parse(reader.GetString(4)),
+                    Status = reader.GetString(5)
+                };
+            }
+            return null;
+        }
+
+        private static async Task<List<Deposit>> GetPendingDepositsAsync()
+        {
+            var deposits = new List<Deposit>();
+            using var cmd = new SQLiteCommand(
+                "SELECT d.Id, d.TelegramId, u.Username, d.Amount, d.Date, d.Status " +
+                "FROM Deposits d LEFT JOIN Users u ON d.TelegramId = u.TelegramId " +
+                "WHERE d.Status = 'Ожидает' ORDER BY d.Date", DbConnection);
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                deposits.Add(new Deposit
+                {
+                    Id = reader.GetInt32(0),
+                    UserId = reader.GetInt64(1),
+                    Username = reader.IsDBNull(2) ? "N/A" : reader.GetString(2),
+                    Amount = reader.GetDecimal(3),
+                    Date = DateTime.Parse(reader.GetString(4)),
+                    Status = reader.GetString(5)
+                });
+            }
+            return deposits;
+        }
+
+        private static async Task<List<Withdrawal>> GetPendingWithdrawalsAsync()
+        {
+            var withdrawals = new List<Withdrawal>();
+            using var cmd = new SQLiteCommand(
+                "SELECT w.Id, w.TelegramId, u.Username, w.Amount, w.Date, w.Status " +
+                "FROM Withdrawals w LEFT JOIN Users u ON w.TelegramId = u.TelegramId " +
+                "WHERE w.Status = 'Ожидает' ORDER BY w.Date", DbConnection);
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                withdrawals.Add(new Withdrawal
+                {
+                    Id = reader.GetInt32(0),
+                    UserId = reader.GetInt64(1),
+                    Username = reader.IsDBNull(2) ? "N/A" : reader.GetString(2),
+                    Amount = reader.GetDecimal(3),
+                    Date = DateTime.Parse(reader.GetString(4)),
+                    Status = reader.GetString(5)
+                });
+            }
+            return withdrawals;
+        }
+
+        private static async Task RegisterReferralAsync(long chatId, string referrerCode)
+        {
+            using var selfCheckCmd = new SQLiteCommand(
+                "SELECT COUNT(*) FROM Users WHERE TelegramId = @id AND ReferralCode = @code", DbConnection);
+            selfCheckCmd.Parameters.AddWithValue("@id", chatId);
+            selfCheckCmd.Parameters.AddWithValue("@code", referrerCode);
+            if ((long)await selfCheckCmd.ExecuteScalarAsync() > 0) return;
+
+            using var existingCheckCmd = new SQLiteCommand(
+                "SELECT COUNT(*) FROM Referrals WHERE RefereeId = @id", DbConnection);
+            existingCheckCmd.Parameters.AddWithValue("@id", chatId);
+            if ((long)await existingCheckCmd.ExecuteScalarAsync() > 0) return;
+
+            using var cmd = new SQLiteCommand(
+                "SELECT TelegramId FROM Users WHERE ReferralCode = @code", DbConnection);
+            cmd.Parameters.AddWithValue("@code", referrerCode);
+            var referrerId = await cmd.ExecuteScalarAsync();
+
+            if (referrerId != null && (long)referrerId != chatId)
+            {
+                using var insertCmd = new SQLiteCommand(
+                    "INSERT INTO Referrals (ReferrerId, RefereeId, Bonus, Date) VALUES (@referrer, @referee, @bonus, @date)", DbConnection);
+                insertCmd.Parameters.AddWithValue("@referrer", referrerId);
+                insertCmd.Parameters.AddWithValue("@referee", chatId);
+                insertCmd.Parameters.AddWithValue("@bonus", 0); // Initialize Bonus to 0
+                insertCmd.Parameters.AddWithValue("@date", DateTime.UtcNow.ToString("o"));
+                await insertCmd.ExecuteNonQueryAsync();
+
+                using var updateCmd = new SQLiteCommand(
+                    "UPDATE Users SET ReferralCount = ReferralCount + 1 WHERE TelegramId = @id", DbConnection);
+                updateCmd.Parameters.AddWithValue("@id", referrerId);
+                await updateCmd.ExecuteNonQueryAsync();
+
+                try
+                {
+                    await BotClient.SendMessage(
+                        chatId: (long)referrerId,
+                        text: $"🎉 Новый реферал присоединился по вашей ссылке! ID: {chatId}",
+                        parseMode: ParseMode.Html,
+                        cancellationToken: CancellationToken.None);
+                }
+                catch { /* Игнорируем ошибки отправки */ }
+            }
+        }
+
+        private static async Task DeleteRequisiteAsync(int id)
+        {
+            using var cmd = new SQLiteCommand("DELETE FROM Requisites WHERE Id = @id", DbConnection);
+            cmd.Parameters.AddWithValue("@id", id);
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        #endregion
+
+        #region Message Handlers
+
+        private static async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
+        {
+            try
+            {
+                if (update.Message != null)
+                {
+                    await HandleMessageAsync(botClient, update.Message, cancellationToken);
+                }
+                else if (update.CallbackQuery != null)
+                {
+                    await HandleCallbackQueryAsync(botClient, update.CallbackQuery, cancellationToken);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка обработки обновления: {ex}");
+            }
+        }
+
+        private static async Task HandleMessageAsync(ITelegramBotClient botClient, Message message, CancellationToken cancellationToken)
+        {
+            var chatId = message.Chat.Id;
+            var text = message.Text?.Trim() ?? "";
+            var messageId = message.MessageId;
+            var username = message.From?.Username ?? "Не указан";
+            using var cmd = new SQLiteCommand("SELECT IsBlocked FROM Users WHERE TelegramId = @id", DbConnection);
+            cmd.Parameters.AddWithValue("@id", chatId);
+            var isBlocked = await cmd.ExecuteScalarAsync();
+            if (isBlocked != null && Convert.ToInt32(isBlocked) == 1)
+            {
+                await botClient.SendMessage(
+                    chatId: chatId,
+                    text: "<b>🔒 Ваш аккаунт заблокирован. Обратитесь к администратору.</b>",
+                    parseMode: ParseMode.Html,
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
+            await UpdateUsernameAsync(chatId, username);
+
+            // Обработка медиафайлов (чеков)
+            if (message.Document != null || message.Photo != null)
+            {
+                if (UserStates.TryGetValue(chatId, out var depositState) && depositState == "waiting_deposit_proof")
+                {
+                    await HandleDepositProofAsync(chatId, message, cancellationToken);
+                    return;
+                }
+            }
+
+            // Обработка состояний (всегда новое сообщение)
+            if (UserStates.TryGetValue(chatId, out var state))
+            {
+                switch (state)
+                {
+                    case "waiting_block_user" when AdminIds.Contains(chatId):
+                        await ProcessBlockUserAsync(chatId, text, messageId, cancellationToken);
+                        break;
+                    case "waiting_unblock_user" when AdminIds.Contains(chatId):
+                        await ProcessUnblockUserAsync(chatId, text, messageId, cancellationToken);
+                        break;
+                    case "waiting_cancel_deposit" when AdminIds.Contains(chatId):
+                        await ProcessCancelDepositAsync(chatId, text, messageId, cancellationToken);
+                        break;
+                    case "waiting_requisite":
+                        await ProcessRequisiteAsync(chatId, text, messageId, cancellationToken);
+                        break;
+                    case var currentState when currentState.StartsWith("editing_requisite_"):
+                        await ProcessEditRequisiteAsync(chatId, text, messageId, currentState, cancellationToken);
+                        break;
+                    case "waiting_deposit":
+                        await ProcessDepositAsync(text, chatId, messageId, cancellationToken);
+                        break;
+                    case "waiting_withdrawal":
+                        await ProcessWithdrawAsync(text, chatId, messageId, cancellationToken);
+                        break;
+                    case "waiting_confirm_deposit" when AdminIds.Contains(chatId):
+                        await ProcessConfirmDepositAsync(chatId, text, messageId, cancellationToken);
+                        break;
+                    case "waiting_confirm_withdrawal" when AdminIds.Contains(chatId):
+                        await ProcessConfirmWithdrawalAsync(chatId, text, messageId, cancellationToken);
+                        break;
+                    case "waiting_calculator_custom":
+                        await ProcessCalculatorCustomAsync(chatId, text, messageId, cancellationToken);
+                        break;
+                    default:
+                        await EditOrSendMessageAsync(
+                            botClient, chatId, messageId,
+                            "<b>❌ Неизвестное состояние.</b> Вернитесь в главное меню.",
+                            GetMainMenuKeyboard(), cancellationToken, "error_state", ParseMode.Html);
+                        UserStates.Remove(chatId);
+                        break;
+                }
+                return;
+            }
+
+            // Обработка команд (редактирование сообщения)
+            InlineKeyboardMarkup keyboard;
+            if (AdminIds.Contains(chatId) && text == "/admin")
+            {
+                keyboard = GetAdminMenuKeyboard();
+                await EditOrSendMessageAsync(botClient, chatId, messageId,
+                    "<b>🛠 Админ-панель</b>", keyboard, cancellationToken, "admin_menu", ParseMode.Html);
+            }
+            else if (text == "/start" || text.StartsWith("/start "))
+            {
+                await RegisterUserAsync(chatId, username);
+                if (text.StartsWith("/start ") && text.Length > 7)
+                {
+                    var referrerCode = text.Substring(7).Trim();
+                    await RegisterReferralAsync(chatId, referrerCode);
+                }
+                keyboard = GetMainMenuKeyboard();
+                await EditOrSendMessageAsync(botClient, chatId, messageId,
+                    "<b>🚀 Добро пожаловать в FAST INVEST!</b>", keyboard, cancellationToken, "start", ParseMode.Html);
+            }
+            else
+            {
+                keyboard = GetMainMenuKeyboard();
+                await EditOrSendMessageAsync(botClient, chatId, messageId,
+                    "<b>🔍 Используйте кнопки для навигации:</b>", keyboard, cancellationToken, "main_menu", ParseMode.Html);
+            }
+        }
+
+        private static async Task HandleCallbackQueryAsync(ITelegramBotClient botClient, CallbackQuery callbackQuery, CancellationToken cancellationToken)
+        {
+            var chatId = callbackQuery.Message.Chat.Id;
+            var messageId = callbackQuery.Message.MessageId;
+            var data = callbackQuery.Data;
+            var username = callbackQuery.From.Username ?? "Неизвестный";
+
+            using var cmd = new SQLiteCommand("SELECT IsBlocked FROM Users WHERE TelegramId = @id", DbConnection);
+            cmd.Parameters.AddWithValue("@id", chatId);
+            var isBlocked = await cmd.ExecuteScalarAsync();
+            if (isBlocked != null && Convert.ToInt32(isBlocked) == 1)
+            {
+                await botClient.AnswerCallbackQuery(
+                    callbackQueryId: callbackQuery.Id,
+                    text: "Ваш аккаунт заблокирован. Обратитесь к администратору.",
+                    showAlert: true,
+                    cancellationToken: cancellationToken);
+                return;
+            }
+            try
+            {
+                Console.WriteLine($"Callback от {username} ({chatId}): {data}");
+
+                // Отвечаем на callback, чтобы убрать часики
+                await botClient.AnswerCallbackQuery(
+                    callbackQueryId: callbackQuery.Id,
+                    cancellationToken: cancellationToken);
+
+                // Обработка повторных нажатий
+                if (LastCallbackData.TryGetValue(chatId, out var lastData) && lastData.Data == data && (DateTime.UtcNow - lastData.Timestamp).TotalSeconds < 2)
+                {
+                    return;
+                }
+                LastCallbackData[chatId] = (data, DateTime.UtcNow);
+
+                InlineKeyboardMarkup keyboard = null;
+                string text = null;
+                bool forceNewMessage = false;
+
+                switch (data)
+                {
+                    case "main_menu":
+                        UserStates.Remove(chatId);
+                        keyboard = GetMainMenuKeyboard();
+                        text = "<b>🚀 Главное меню</b>\n\nВыберите действие:";
+
+                        // Используем messageId из callback, если LastMessageIds пуст
+                        if (!LastMessageIds.TryGetValue(chatId, out var mainMenuId) || mainMenuId <= 0)
+                        {
+                            mainMenuId = messageId;
+                            LastMessageIds[chatId] = messageId;
+                            Console.WriteLine($"LastMessageIds не содержит ID для {chatId}, используем и сохраняем messageId: {messageId}");
+                        }
+
+                        await EditOrSendMessageAsync(
+                            botClient, chatId, mainMenuId,
+                            text, keyboard, cancellationToken, "main_menu", ParseMode.Html, forceNewMessage: false);
+                        break;
+
+                    case "my_deposit":
+                        await ShowDepositPageAsync(botClient, chatId, messageId, cancellationToken);
+                        return;
+
+                    case "deposit":
+                    case "add_deposit":
+                        UserStates[chatId] = "waiting_deposit";
+                        keyboard = new InlineKeyboardMarkup(
+                            InlineKeyboardButton.WithCallbackData("🔙 Назад", "my_deposit"));
+                        text = data == "add_deposit"
+                            ? "<b>💸 Довнесение депозита</b>\n\nВведите сумму для довнесения:"
+                            : "<b>💳 Внесение депозита</b>\n\nМинимальная сумма: 10,000 ₽\n\nВведите сумму депозита:";
+                        forceNewMessage = true;
+                        break;
+
+                    case "withdraw":
+                        if (await CanWithdrawAsync(chatId))
+                        {
+                            UserStates[chatId] = "waiting_withdrawal";
+                            keyboard = new InlineKeyboardMarkup(
+                                InlineKeyboardButton.WithCallbackData("🔙 Назад", "my_deposit"));
+                            text = "<b>💰 Запрос вывода</b>\n\nВведите сумму для вывода:";
+                            forceNewMessage = true;
+                        }
+                        else
+                        {
+                            await botClient.AnswerCallbackQuery(
+                                callbackQuery.Id,
+                                "Вывод доступен только через 7 дней после последнего депозита",
+                                cancellationToken: cancellationToken);
+                            return;
+                        }
+                        break;
+
+                    case "withdraw_disabled":
+                        await botClient.AnswerCallbackQuery(
+                            callbackQuery.Id,
+                            "Вывод будет доступен через 7 дней после последнего депозита",
+                            cancellationToken: cancellationToken);
+                        return;
+
+                    case "balance":
+                        await UpdateUserStatusAsync(chatId);
+
+                        // Получаем сумму подтверждённых депозитов
+                        decimal totalDeposit = 0;
+                        using (var depositCmd = new SQLiteCommand(
+                            "SELECT SUM(Amount) FROM Deposits WHERE TelegramId = @id AND Status = 'Подтверждён'",
+                            DbConnection))
+                        {
+                            depositCmd.Parameters.AddWithValue("@id", chatId);
+                            var result = await depositCmd.ExecuteScalarAsync(cancellationToken);
+                            totalDeposit = result is DBNull ? 0 : Convert.ToDecimal(result);
+                            Console.WriteLine($"[Balance] TotalDeposit for chatId {chatId}: {totalDeposit:F2}");
+                        }
+
+                        // Получаем проценты и статус пользователя
+                        decimal totalInterest = 0;
+                        string userStatus = "Новичок";
+                        using (var userCmd = new SQLiteCommand(
+                            "SELECT Interest, Status FROM Users WHERE TelegramId = @id",
+                            DbConnection))
+                        {
+                            userCmd.Parameters.AddWithValue("@id", chatId);
+                            using var reader = await userCmd.ExecuteReaderAsync(cancellationToken);
+                            if (await reader.ReadAsync())
+                            {
+                                totalInterest = reader.GetDecimal(0);
+                                userStatus = reader.GetString(1);
+                            }
+                            else
+                            {
+                                // Если пользователь не найден, отправляем ошибку
+                                await EditOrSendMessageAsync(
+                                    botClient, chatId, messageId,
+                                    "<b>❗ Ошибка</b>\n\nВаш профиль не найден. Пожалуйста, зарегистрируйтесь.",
+                                    new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 В главное меню", "main_menu")),
+                                    cancellationToken, "balance_error", ParseMode.Html, forceNewMessage: true);
+                                break;
+                            }
+                        }
+
+                        // Получаем количество рефералов и имя пользователя
+                        int referralCount = await GetReferralCountAsync(chatId);
+                        username = await GetUsernameAsync(chatId) ?? chatId.ToString();
+                        decimal weeklyRate = totalDeposit >= 50000 ? 0.06m : 0.05m;
+                        decimal referralBonusRate = referralCount >= 5 ? 0.02m : 0.01m;
+
+                        // Определяем эмодзи статуса
+                        string statusEmoji = userStatus switch
+                        {
+                            "Новичок" => "🐣",
+                            "Профи" => "🦁",
+                            "Кит" => "🐳",
+                            _ => "❓"
+                        };
+
+                        // Формируем прогресс-бар
+                        string progressText;
+                        string progressBar;
+                        int progressPercent;
+                        if (userStatus == "Кит")
+                        {
+                            progressText = "🎉 Максимальный уровень достигнут!";
+                            progressBar = string.Concat(Enumerable.Repeat("🟢", 10));
+                            progressPercent = 100;
+                        }
+                        else if (userStatus == "Профи")
+                        {
+                            decimal depositNeeded = 100000 - totalDeposit;
+                            int referralsNeeded = 10 - referralCount;
+                            progressPercent = (int)Math.Clamp((totalDeposit / 100000m + referralCount / 10m) / 2m * 100, 0, 100);
+                            progressText = $"До <b>Кита</b> 🐳: {(depositNeeded > 0 ? $"внесите {depositNeeded:F2} ₽ и " : "")}пригласите {referralsNeeded} рефералов";
+                            progressBar = string.Concat(Enumerable.Repeat("🟢", progressPercent / 10)) +
+                                          string.Concat(Enumerable.Repeat("⚪", 10 - progressPercent / 10));
+                        }
+                        else
+                        {
+                            decimal depositNeeded = 50000 - totalDeposit;
+                            int referralsNeeded = 5 - referralCount;
+                            progressPercent = (int)Math.Clamp(Math.Max(totalDeposit / 50000m * 50, referralCount / 5m * 50), 0, 100);
+                            progressText = $"До <b>Профи</b> 🦁: {(depositNeeded > 0 ? $"внесите {depositNeeded:F2} ₽ или " : "")}пригласите {referralsNeeded} рефералов";
+                            progressBar = string.Concat(Enumerable.Repeat("🟢", progressPercent / 10)) +
+                                          string.Concat(Enumerable.Repeat("⚪", 10 - progressPercent / 10));
+                        }
+
+                        Console.WriteLine($"[Balance] ProgressPercent for chatId {chatId}: {progressPercent}%");
+
+                        // Формируем сообщение
+                        text = $"""
+                            <b>👤 Профиль</b>
+
+                            🧑 <b>Пользователь</b>: @{HtmlEscape(username)}
+                            <b>Статус</b>: {HtmlEscape(userStatus)} {statusEmoji}
+                            📊 <b>Депозит</b>: {totalDeposit:F2} ₽
+                            💵 <b>Начисленные проценты</b>: {totalInterest:F2} ₽
+                            👥 <b>Рефералы</b>: {referralCount}
+                            📈 <b>Процентная ставка</b>: {(weeklyRate * 100):F1}% в неделю
+                            🎁 <b>Реферальный бонус</b>: {(referralBonusRate * 100):F1}% от депозита реферала
+                            📈 <b>Прогресс ({progressPercent}%)</b>:
+                            {progressText}
+                                          
+                            <b>Выберите действие:</b>
+                            """;
+
+                        // Создаём кнопки
+                        var buttons = new List<InlineKeyboardButton[]>
+                        {
+                            new[] { InlineKeyboardButton.WithCallbackData("🤝 Пригласить реферала", "referral") },
+                            new[] { InlineKeyboardButton.WithCallbackData(totalDeposit > 0 ? "💸 Довнести депозит" : "💳 Внести депозит", totalDeposit > 0 ? "add_deposit" : "deposit") },
+                            new[] { InlineKeyboardButton.WithCallbackData("🔙 В главное меню", "main_menu") }
+                        };
+                        keyboard = new InlineKeyboardMarkup(buttons);
+
+                        // Определяем messageId для отправки или редактирования
+                        int messageIdToUse = LastMessageIds.TryGetValue(chatId, out var storedMessageId) && storedMessageId > 0
+                            ? storedMessageId
+                            : messageId;
+                        LastMessageIds[chatId] = messageIdToUse;
+
+                        // Отправляем или редактируем сообщение
+                        await EditOrSendMessageAsync(
+                            botClient, chatId, messageIdToUse,
+                            text, keyboard, cancellationToken, "balance", ParseMode.Html, forceNewMessage: false);
+                        break;
+                    case "referral":
+                        var referralCode = await GetReferralCodeAsync(chatId);
+                        referralCount = await GetReferralCountAsync(chatId);
+                        var bonusRate = referralCount >= 5 ? "2%" : "1%";
+                        var bonusAmount = 10000 * (referralCount >= 5 ? 0.02m : 0.01m);
+
+                        // Получаем сумму заработанных реферальных бонусов
+                        decimal totalReferralBonus = 0;
+                        using (var referralcmd = new SQLiteCommand(
+                            "SELECT SUM(Bonus) FROM Referrals WHERE ReferrerId = @id",
+                            DbConnection))
+                        {
+                            cmd.Parameters.AddWithValue("@id", chatId);
+                            var result = await cmd.ExecuteScalarAsync();
+                            Console.WriteLine($"Результат SUM(Bonus) для ReferrerId {chatId}: {result ?? "NULL"}");
+                            totalReferralBonus = result is DBNull ? 0 : Convert.ToDecimal(result);
+                        }
+
+                        var referralLink = $"https://t.me/{(await botClient.GetMe()).Username}?start={Uri.EscapeDataString(referralCode)}";
+                        var shareText = $"Присоединяйся к FAST INVEST! 🚀\n\n" +
+                                        $"Получай 5% прибыли еженедельно!\n" +
+                                        $"Моя реферальная ссылка: {referralLink}";
+
+                        keyboard = new InlineKeyboardMarkup(new[]
+                        {
+                            new[] { InlineKeyboardButton.WithUrl(
+                                "📢 Поделиться",
+                                $"https://t.me/share/url?url={Uri.EscapeDataString(referralLink)}&text={Uri.EscapeDataString(shareText)}") },
+                            new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "main_menu") }
+                        });
+
+                                            text = $"""
+                            <b>🤝 Реферальная программа</b>
+                            👤 <b>Ваш код</b>: <code>{HtmlEscape(referralCode)}</code>
+                            👥 <b>Рефералов</b>: {referralCount}
+                            💰 <b>Ваш бонус</b>: {HtmlEscape(bonusRate)} от депозита друга
+                            💸 <b>Заработано с рефералов</b>: {totalReferralBonus:F2} ₽
+                            🎁 <b>Пример</b>: за депозит 10,000 ₽ вы получите {bonusAmount:F2} ₽
+                            🔗 <b>Ваша ссылка</b>: <code>{HtmlEscape(referralLink)}</code>
+                            """;
+                        break;
+
+                    case "calculator":
+                        keyboard = new InlineKeyboardMarkup(new[]
+                        {
+                    new[] { InlineKeyboardButton.WithCallbackData("10,000 ₽", "calc_10000"),
+                            InlineKeyboardButton.WithCallbackData("50,000 ₽", "calc_50000"),
+                            InlineKeyboardButton.WithCallbackData("100,000 ₽", "calc_100000") },
+                    new[] { InlineKeyboardButton.WithCallbackData("1 неделя", "calc_1week"),
+                            InlineKeyboardButton.WithCallbackData("4 недели", "calc_4week"),
+                            InlineKeyboardButton.WithCallbackData("12 недель", "calc_12week") },
+                    new[] { InlineKeyboardButton.WithCallbackData("✍️ Ввести свои данные", "calc_custom") },
+                    new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "main_menu") }
+                });
+                        text = "<b>📊 Калькулятор прибыли</b>\n\nВыберите сумму депозита, срок инвестиции или введите свои данные:";
+                        break;
+
+                    case "calc_10000":
+                    case "calc_50000":
+                    case "calc_100000":
+                        var amount = data switch { "calc_10000" => 10000m, "calc_50000" => 50000m, "calc_100000" => 100000m, _ => 10000m };
+                        UserStates[chatId] = $"waiting_calculator_amount_{amount}";
+                        keyboard = new InlineKeyboardMarkup(new[]
+                        {
+                    new[] { InlineKeyboardButton.WithCallbackData("1 неделя", "calc_1week"),
+                            InlineKeyboardButton.WithCallbackData("4 недели", "calc_4week"),
+                            InlineKeyboardButton.WithCallbackData("12 недель", "calc_12week") },
+                    new[] { InlineKeyboardButton.WithCallbackData("✍️ Ввести свои данные", "calc_custom") },
+                    new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "calculator") }
+                });
+                        text = $"<b>📊 Калькулятор прибыли</b>\n\nВыбрана сумма: {amount:F2} ₽\n\nВыберите срок инвестиции или введите свои данные:";
+                        break;
+
+                    case "calc_1week":
+                    case "calc_4week":
+                    case "calc_12week":
+                        if (!UserStates.TryGetValue(chatId, out var calcState) || !calcState.StartsWith("waiting_calculator_amount_"))
+                        {
+                            keyboard = new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "calculator") });
+                            text = "<b>❗ Ошибка</b>\n\nСначала выберите сумму депозита.";
+                            break;
+                        }
+
+                        var calcAmount = decimal.Parse(calcState.Replace("waiting_calculator_amount_", ""));
+                        var weeks = data switch { "calc_1week" => 1, "calc_4week" => 4, "calc_12week" => 12, _ => 1 };
+                        var resultText = await CalculateProfitAsync(calcAmount, weeks);
+
+                        keyboard = new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "calculator") });
+                        text = resultText;
+                        UserStates.Remove(chatId);
+                        break;
+
+                    case "calc_custom":
+                        UserStates[chatId] = "waiting_calculator_custom";
+                        keyboard = new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "calculator") });
+                        text = "<b>📊 Калькулятор прибыли</b>\n\nВведите сумму депозита и количество недель (через пробел, например: 15000 8):";
+                        forceNewMessage = true;
+                        break;
+
+                    case "requisites_menu":
+                        await ShowRequisitesMenuAsync(chatId, messageId, cancellationToken);
+                        return;
+
+                    case "add_requisite":
+                        UserStates[chatId] = "waiting_requisite";
+                        keyboard = new InlineKeyboardMarkup(
+                            InlineKeyboardButton.WithCallbackData("🔙 Назад", "requisites_menu"));
+                        text = """
+                    <b>📋 Введите реквизиты в формате:</b>
+                    • Для карты: <code>card|Банк|Номер карты</code>
+                    • Для крипты: <code>crypto|Монета|Адрес кошелька</code>
+                    Пример: <code>card|Сбербанк|1234 5678 9012 3456</code>
+                    """;
+                        forceNewMessage = true;
+                        break;
+
+                    case var reqCase when reqCase.StartsWith("requisite_detail_"):
+                        if (int.TryParse(reqCase.Split('_')[2], out int reqId))
+                        {
+                            await ShowRequisiteDetailsAsync(chatId, messageId, reqId, cancellationToken);
+                        }
+                        return;
+
+                    case var editCase when editCase.StartsWith("edit_requisite_"):
+                        if (int.TryParse(editCase.Split('_')[2], out int editId))
+                        {
+                            UserStates[chatId] = $"editing_requisite_{editId}";
+                            var req = await GetRequisiteByIdAsync(editId);
+                            keyboard = new InlineKeyboardMarkup(
+                                InlineKeyboardButton.WithCallbackData("🔙 Отмена", $"requisite_detail_{editId}"));
+                            text = $"""
+                        <b>✏️ Редактирование реквизитов</b>:
+                        Текущие: {HtmlEscape(req.Type)}|{HtmlEscape(req.BankOrCoin)}|{HtmlEscape(req.Details)}
+                        Введите новые данные в формате:
+                        <code>тип|банк/монета|реквизиты</code>
+                        """;
+                            forceNewMessage = true;
+                        }
+                        break;
+
+                    case var delCase when delCase.StartsWith("delete_requisite_"):
+                        if (int.TryParse(delCase.Split('_')[2], out int delId))
+                        {
+                            await DeleteRequisiteAsync(delId);
+                            await ShowRequisitesMenuAsync(chatId, messageId, cancellationToken);
+                        }
+                        return;
+
+                    case "deposits_list":
+                        await ShowDepositsListAsync(chatId, messageId, cancellationToken);
+                        return;
+
+                    case var depCase when depCase.StartsWith("confirm_deposit_"):
+                        if (int.TryParse(depCase.Split('_')[2], out int depositId))
+                        {
+                            await ConfirmDepositAsync(chatId, depositId, messageId, cancellationToken);
+                        }
+                        return;
+
+                    case "withdrawals_list":
+                        await ShowWithdrawalsListAsync(botClient, chatId, messageId, cancellationToken);
+                        return;
+
+                    case var wCase when wCase.StartsWith("confirm_withdrawal_"):
+                        if (int.TryParse(wCase.Split('_')[2], out int withdrawalId))
+                        {
+                            await ConfirmWithdrawalAsync(chatId, withdrawalId.ToString(), messageId, cancellationToken);
+                        }
+                        return;
+
+                    case "pending_proofs":
+                        await ShowPendingProofsAsync(botClient, chatId, messageId, cancellationToken);
+                        return;
+
+                    case "view_deposits":
+                        await ViewDepositsAsync(botClient, chatId, messageId, cancellationToken);
+                        return;
+
+                    case "view_withdrawals":
+                        await ViewWithdrawalsAsync(botClient, chatId, messageId, cancellationToken);
+                        return;
+
+                    case "view_referrals":
+                        await ViewReferralsAsync(botClient, chatId, messageId, cancellationToken);
+                        return;
+
+                    case "confirm_deposit":
+                        UserStates[chatId] = "waiting_confirm_deposit";
+                        keyboard = new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") });
+                        text = "<b>✅ Подтверждение депозита</b>\n\nВведите ID депозита для подтверждения:";
+                        forceNewMessage = true;
+                        break;
+
+                    case "confirm_withdrawal":
+                        UserStates[chatId] = "waiting_confirm_withdrawal";
+                        keyboard = new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") });
+                        text = "<b>💸 Подтверждение вывода</b>\n\nВведите ID вывода для подтверждения:";
+                        forceNewMessage = true;
+                        break;
+
+                    case "admin_menu":
+                        keyboard = GetAdminMenuKeyboard();
+                        text = "<b>🛠 Админ-панель</b>\n\nВыберите действие:";
+                        UserStates.Remove(chatId);
+                        break;
+                    case "block_user":
+                        UserStates[chatId] = "waiting_block_user";
+                        keyboard = new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") });
+                        text = "<b>🔒 Блокировка пользователя</b>\n\nВведите Telegram ID пользователя для блокировки:";
+                        forceNewMessage = true;
+                        break;
+
+                    case "unblock_user":
+                        UserStates[chatId] = "waiting_unblock_user";
+                        keyboard = new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") });
+                        text = "<b>🔓 Разблокировка пользователя</b>\n\nВведите Telegram ID пользователя для разблокировки:";
+                        forceNewMessage = true;
+                        break;
+                    case "cancel_deposit":
+                        UserStates.Remove(chatId);
+                        keyboard = GetMainMenuKeyboard();
+                        text = "<b>🚀 Главное меню</b>\n\nВыберите действие:";
+                        break;
+                    case "cancel_deposit_admin":
+                        UserStates[chatId] = "waiting_cancel_deposit";
+                        keyboard = new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") });
+                        text = "<b>❌ Отмена депозита</b>\n\nВведите ID депозита для отмены:";
+                        forceNewMessage = true;
+                        break;
+
+                    default:
+                        keyboard = GetMainMenuKeyboard();
+                        text = "⚠ Неизвестная команда. Пожалуйста, попробуйте снова.";
+                        break;
+                }
+
+                if (keyboard != null && text != null)
+                {
+                    await EditOrSendMessageAsync(
+                        botClient, chatId, messageId, text, keyboard, cancellationToken, data, ParseMode.Html, forceNewMessage);
+                }
+                else
+                {
+                    Console.WriteLine($"Не определены keyboard или text для callback: {data}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка обработки callback: {ex}");
+                await botClient.SendMessage(
+                    chatId: chatId,
+                    text: "⚠ Произошла ошибка. Пожалуйста, попробуйте снова.",
+                    replyMarkup: GetMainMenuKeyboard(),
+                    parseMode: ParseMode.Html,
+                    cancellationToken: cancellationToken);
+            }
+        }
+
+        private static async Task HandleDepositProofAsync(long chatId, Message message, CancellationToken cancellationToken)
+        {
+            try
+            {
+                // Проверяем наличие медиафайла
+                if (message.Document == null && message.Photo == null)
+                {
+                    await EditOrSendMessageAsync(
+                        BotClient, chatId, message.MessageId,
+                        "❌ Поддерживаются только фото или документы. Пожалуйста, отправьте чек в формате JPEG, PNG или PDF.",
+                        new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 Назад", "my_deposit")),
+                        cancellationToken, "deposit_proof_error", ParseMode.Html, forceNewMessage: true, ignoreLastMessageId: true);
+                    return;
+                }
+
+                // Получаем fileId, тип файла и размер
+                string fileId;
+                string fileType;
+                long? fileSize;
+
+                if (message.Document != null)
+                {
+                    var validExtensions = new[] { ".pdf", ".jpg", ".jpeg", ".png" };
+                    var fileExt = Path.GetExtension(message.Document.FileName)?.ToLower();
+
+                    if (fileExt == null || !validExtensions.Contains(fileExt))
+                    {
+                        await EditOrSendMessageAsync(
+                            BotClient, chatId, message.MessageId,
+                            "❌ Формат файла не поддерживается. Отправьте чек в формате PDF, JPEG или PNG.",
+                            new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 Назад", "my_deposit")),
+                            cancellationToken, "deposit_proof_format_error", ParseMode.Html, forceNewMessage: true, ignoreLastMessageId: true);
+                        return;
+                    }
+
+                    fileId = message.Document.FileId;
+                    fileType = "document";
+                    fileSize = message.Document.FileSize;
+                }
+                else
+                {
+                    var photoSize = message.Photo!.OrderByDescending(p => p.FileSize).First();
+                    fileId = photoSize.FileId;
+                    fileType = "photo";
+                    fileSize = photoSize.FileSize;
+                }
+
+                // Проверяем размер файла (максимум 50 МБ для Telegram Bot API)
+                if (fileSize > 50 * 1024 * 1024)
+                {
+                    await EditOrSendMessageAsync(
+                        BotClient, chatId, message.MessageId,
+                        "❌ Размер файла превышает 50 МБ. Пожалуйста, отправьте файл меньшего размера.",
+                        new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 Назад", "my_deposit")),
+                        cancellationToken, "deposit_proof_size_error", ParseMode.Html, forceNewMessage: true, ignoreLastMessageId: true);
+                    return;
+                }
+
+                // Начинаем транзакцию
+                using var transaction = DbConnection.BeginTransaction();
+                try
+                {
+                    // Получаем последний ожидающий депозит пользователя
+                    int depositId;
+                    decimal amount;
+
+                    using (var getDepositCmd = new SQLiteCommand(
+                        "SELECT Id, Amount FROM Deposits WHERE TelegramId = @id AND Status = 'Ожидает' ORDER BY Date DESC LIMIT 1",
+                        DbConnection))
+                    {
+                        getDepositCmd.Parameters.AddWithValue("@id", chatId);
+                        using var reader = await getDepositCmd.ExecuteReaderAsync(cancellationToken);
+                        if (!reader.HasRows)
+                        {
+                            await EditOrSendMessageAsync(
+                                BotClient, chatId, message.MessageId,
+                                "⚠ Не найден ожидающий депозит. Пожалуйста, начните процесс заново.",
+                                new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 В главное меню", "main_menu")),
+                                cancellationToken, "deposit_proof_no_deposit", ParseMode.Html, forceNewMessage: true, ignoreLastMessageId: true);
+                            UserStates.Remove(chatId);
+                            return;
+                        }
+
+                        await reader.ReadAsync();
+                        depositId = reader.GetInt32(0);
+                        amount = reader.GetDecimal(1);
+                    }
+
+                    // Сохраняем чек в базу
+                    using (var insertCmd = new SQLiteCommand(
+                        "INSERT INTO DepositProofs (TelegramId, DepositId, FileId, FileType, Date, Status) " +
+                        "VALUES (@id, @depositId, @fileId, @type, @date, 'Ожидает')",
+                        DbConnection))
+                    {
+                        insertCmd.Parameters.AddWithValue("@id", chatId);
+                        insertCmd.Parameters.AddWithValue("@depositId", depositId);
+                        insertCmd.Parameters.AddWithValue("@fileId", fileId);
+                        insertCmd.Parameters.AddWithValue("@type", fileType);
+                        insertCmd.Parameters.AddWithValue("@date", DateTime.UtcNow.ToString("o"));
+                        await insertCmd.ExecuteNonQueryAsync(cancellationToken);
+                    }
+
+                    transaction.Commit();
+
+                    // Получаем имя пользователя
+                    var username = await GetUsernameAsync(chatId);
+                    var caption = $"Чек на депозит {amount:F2} ₽ от {username} (ID: {chatId}, Депозит ID: {depositId})";
+
+                    // Уведомляем админов
+                    foreach (var adminId in AdminIds)
+                    {
+                        try
+                        {
+                            await BotClient.SendMessage(
+                                chatId: adminId,
+                                text: $"🔔 Новый чек на депозит {amount:F2} ₽ от {username} (ID: {chatId})",
+                                cancellationToken: cancellationToken);
+
+                            if (fileType == "document")
+                            {
+                                await BotClient.SendDocument(
+                                    chatId: adminId,
+                                    document: new InputFileId(fileId),
+                                    caption: caption,
+                                    cancellationToken: cancellationToken);
+                            }
+                            else
+                            {
+                                await BotClient.SendPhoto(
+                                    chatId: adminId,
+                                    photo: new InputFileId(fileId),
+                                    caption: caption,
+                                    cancellationToken: cancellationToken);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}] Ошибка уведомления админа {adminId}: {ex}");
+                        }
+                    }
+
+                    // Отправляем подтверждение пользователю
+                    var sentMessage = await EditOrSendMessageAsync(
+                        BotClient, chatId, message.MessageId,
+                        $"✅ Чек на сумму {amount:F2} ₽ успешно отправлен на проверку!\nОжидайте подтверждения.",
+                        new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 В главное меню", "main_menu")),
+                        cancellationToken, "deposit_proof_success", ParseMode.Html, forceNewMessage: true, ignoreLastMessageId: false);
+
+                    // Обновляем LastMessageIds
+                    LastMessageIds[chatId] = sentMessage.MessageId;
+
+                    // Сбрасываем состояние
+                    UserStates.Remove(chatId);
+                }
+                catch (Exception)
+                {
+                    transaction.Rollback();
+                    throw;
+                }
+            }
+            catch (SQLiteException ex)
+            {
+                Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}] Ошибка базы данных при обработке чека: {ex}");
+                var sentMessage = await EditOrSendMessageAsync(
+                    BotClient, chatId, message.MessageId,
+                    "⚠ Ошибка сервера при обработке чека. Пожалуйста, попробуйте еще раз.",
+                    new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 В главное меню", "main_menu")),
+                    cancellationToken, "deposit_proof_error", ParseMode.Html, forceNewMessage: true, ignoreLastMessageId: false);
+                LastMessageIds[chatId] = sentMessage.MessageId;
+                UserStates.Remove(chatId);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}] Ошибка обработки чека: {ex}");
+                var sentMessage = await EditOrSendMessageAsync(
+                    BotClient, chatId, message.MessageId,
+                    "⚠ Произошла ошибка при обработке чека. Пожалуйста, попробуйте еще раз.",
+                    new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 В главное меню", "main_menu")),
+                    cancellationToken, "deposit_proof_error", ParseMode.Html, forceNewMessage: true, ignoreLastMessageId: false);
+                LastMessageIds[chatId] = sentMessage.MessageId;
+                UserStates.Remove(chatId);
+            }
+        }
+
+        #endregion
+
+        #region Menu Methods
+
+        private static InlineKeyboardMarkup GetMainMenuKeyboard()
+        {
+            return new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithCallbackData("💰 Мой депозит", "my_deposit") },
+                new[] { InlineKeyboardButton.WithCallbackData("🤝 Реферальная программа", "referral") },
+                new[] { InlineKeyboardButton.WithCallbackData("📊 Калькулятор прибыли", "calculator") },
+                new[] { InlineKeyboardButton.WithCallbackData("👤 Профиль", "balance") }
+            });
+        }
+
+        private static InlineKeyboardMarkup GetAdminMenuKeyboard()
+        {
+            return new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithCallbackData("📋 Реквизиты", "requisites_menu") },
+                new[] { InlineKeyboardButton.WithCallbackData("💳 Депозиты", "deposits_list") },
+                new[] { InlineKeyboardButton.WithCallbackData("💸 Выводы", "withdrawals_list") },
+                new[] { InlineKeyboardButton.WithCallbackData("🧾 Чеки на проверку", "pending_proofs") },
+                new[] { InlineKeyboardButton.WithCallbackData("❌ Отменить депозит", "cancel_deposit_admin") },
+                new[] { InlineKeyboardButton.WithCallbackData("🔒 Заблокировать пользователя", "block_user") },
+                new[] { InlineKeyboardButton.WithCallbackData("🔓 Разблокировать пользователя", "unblock_user") },
+                new[] { InlineKeyboardButton.WithCallbackData("🔙 В главное меню", "main_menu") }
+            });
+        }
+
+        private static async Task ShowRequisitesMenuAsync(long chatId, int messageId, CancellationToken cancellationToken)
+        {
+            var requisites = await GetAllRequisitesAsync();
+            var buttons = requisites.Select(req => new[] { InlineKeyboardButton.WithCallbackData($"{req.Type} ({req.BankOrCoin})", $"requisite_detail_{req.Id}") }).ToList();
+            buttons.Add(new[] { InlineKeyboardButton.WithCallbackData("➕ Добавить", "add_requisite"), InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") });
+
+            await EditOrSendMessageAsync(
+                BotClient, chatId, messageId,
+                "<b>📋 Управление реквизитами</b>",
+                new InlineKeyboardMarkup(buttons), cancellationToken, "requisites_menu", ParseMode.Html);
+        }
+
+        private static async Task ShowRequisiteDetailsAsync(long chatId, int messageId, int reqId, CancellationToken cancellationToken)
+        {
+            var req = await GetRequisiteByIdAsync(reqId);
+            if (req == null)
+            {
+                await BotClient.SendMessage(
+                    chatId: chatId,
+                    text: "<b>⚠ Реквизиты не найдены</b>",
+                    parseMode: ParseMode.Html,
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
+            var message = $"""
+                <b>📋 Реквизиты</b>\n\n
+                <b>Тип</b>: {HtmlEscape(req.Type)}\n\n
+                <b>Банк/Монета</b>: {HtmlEscape(req.BankOrCoin)}\n\n
+                <b>Данные</b>: <code>{HtmlEscape(req.Details)}</code>\n\n
+                <b>Добавлено</b>: {req.DateAdded:dd.MM.yyyy}
+                """;
+
+            var keyboard = new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("✏️ Редактировать", $"edit_requisite_{reqId}"),
+                    InlineKeyboardButton.WithCallbackData("❌ Удалить", $"delete_requisite_{reqId}")
+                },
+                new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "requisites_menu") }
+            });
+
+            await EditOrSendMessageAsync(
+                BotClient, chatId, messageId, message, keyboard, cancellationToken, $"requisite_detail_{reqId}", ParseMode.Html);
+        }
+
+        private static async Task ShowDepositPageAsync(ITelegramBotClient botClient, long chatId, int messageId, CancellationToken cancellationToken)
+        {
+            try
+            {
+                // Получаем информацию о депозитах пользователя
+                decimal totalDeposit = 0;
+                DateTime? lastDepositDate = null;
+                string lastDepositStatus = "Нет депозитов";
+                int pendingDeposits = 0;
+
+                using (var cmd = new SQLiteCommand(
+                    "SELECT Amount, Date, Status FROM Deposits WHERE TelegramId = @id ORDER BY Date DESC",
+                    DbConnection))
+                {
+                    cmd.Parameters.AddWithValue("@id", chatId);
+                    using var reader = await cmd.ExecuteReaderAsync();
+                    while (await reader.ReadAsync())
+                    {
+                        var amount = reader.GetDecimal(0);
+                        var status = reader.GetString(2);
+                        if (status == "Подтверждён")
+                        {
+                            totalDeposit += amount;
+                        }
+                        if (lastDepositDate == null)
+                        {
+                            lastDepositDate = DateTime.Parse(reader.GetString(1));
+                            lastDepositStatus = status;
+                        }
+                        if (status == "Ожидает")
+                        {
+                            pendingDeposits++;
+                        }
+                    }
+                }
+
+                // Получаем начисленные проценты
+                decimal totalInterest = 0;
+                using (var cmd = new SQLiteCommand(
+                    "SELECT Interest FROM Users WHERE TelegramId = @id",
+                    DbConnection))
+                {
+                    cmd.Parameters.AddWithValue("@id", chatId);
+                    using var reader = await cmd.ExecuteReaderAsync();
+                    if (await reader.ReadAsync())
+                    {
+                        totalInterest = reader.GetDecimal(0);
+                    }
+                }
+
+                // Рассчитываем процентную ставку и проценты за сегодня
+                decimal weeklyRate = totalDeposit >= 50000 ? 0.06m : 0.05m;
+                decimal dailyRate = weeklyRate / 7;
+                decimal dailyInterest = totalInterest > 0 ? totalDeposit * dailyRate : 0m; // Учитываем только если проценты уже начислен
+
+                // Рассчитываем время до вывода
+                // Рассчитываем время до вывода
+                string withdrawalStatus;
+                bool canWithdraw = true;
+                if (lastDepositDate.HasValue && lastDepositStatus == "Подтверждён")
+                {
+                    var timeSinceDeposit = DateTime.UtcNow - lastDepositDate.Value;
+                    var daysUntilWithdrawal = 7 - timeSinceDeposit.TotalDays;
+                    if (daysUntilWithdrawal > 0)
+                    {
+                        canWithdraw = false;
+                        var days = (int)Math.Floor(daysUntilWithdrawal);
+                        var hours = (int)((daysUntilWithdrawal - days) * 24);
+                        withdrawalStatus = $"⏳ Осталось: {Math.Min(days, 7)} дн. {hours} ч.";
+                    }
+                    else
+                    {
+                        withdrawalStatus = "✅ Доступно";
+                    }
+                }
+                else if (lastDepositStatus == "Ожидает")
+                {
+                    canWithdraw = false;
+                    withdrawalStatus = "⏳ Ожидает подтверждения депозита";
+                }
+                else
+                {
+                    withdrawalStatus = "📉 Нет активных депозитов";
+                }
+
+                // Формируем текст меню
+                var text = $"""
+                    <b>💼 Мой депозит</b>
+
+                    📊 <b>Общая сумма депозита</b>: {totalDeposit:F2} ₽
+                    📈 <b>Процентная ставка</b>: {(weeklyRate * 100):F1}% в неделю
+                    💰 <b>Прибыль за сегодня</b>: {dailyInterest:F2} ₽
+                    💵 <b>Начисленные проценты</b>: {totalInterest:F2} ₽
+                    {(pendingDeposits > 0 ? $"🔔 <b>Ожидающие депозиты</b>: {pendingDeposits}" : "")}
+                    ⏰ <b>Вывод средств</b>: {withdrawalStatus}
+
+                    Выберите действие:
+                    """;
+
+                // Формируем клавиатуру
+                var buttons = new List<InlineKeyboardButton[]>();
+                if (totalDeposit > 0)
+                {
+                    buttons.Add(new[] { InlineKeyboardButton.WithCallbackData("💸 Довнести депозит", "add_deposit") });
+                    buttons.Add(new[] { InlineKeyboardButton.WithCallbackData(
+                canWithdraw ? "💰 Запросить вывод" : "💰 Вывод недоступен",
+                canWithdraw ? "withdraw" : "withdraw_disabled") });
+                }
+                else
+                {
+                    buttons.Add(new[] { InlineKeyboardButton.WithCallbackData("💳 Внести депозит", "deposit") });
+                }
+                buttons.Add(new[] { InlineKeyboardButton.WithCallbackData("🔙 В главное меню", "main_menu") });
+
+                var keyboard = new InlineKeyboardMarkup(buttons);
+
+                // Отправляем или редактируем сообщение
+                await EditOrSendMessageAsync(
+                    botClient, chatId, messageId,
+                    text, keyboard, cancellationToken, "my_deposit", ParseMode.Html, forceNewMessage: false);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка отображения депозитной страницы: {ex}");
+                await EditOrSendMessageAsync(
+                    botClient, chatId, messageId,
+                    "⚠ Произошла ошибка. Пожалуйста, попробуйте снова.",
+                    new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 В главное меню", "main_menu")),
+                    cancellationToken, "deposit_page_error", ParseMode.Html, forceNewMessage: false);
+            }
+        }
+
+        private static async Task ShowDepositsListAsync(long chatId, int messageId, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var deposits = await GetPendingDepositsAsync();
+                var message = new StringBuilder("<b>💳 Ожидающие депозиты</b>\n\n");
+
+                if (!deposits.Any())
+                {
+                    message.AppendLine("Нет ожидающих депозитов.");
+                }
+                else
+                {
+                    foreach (var dep in deposits)
+                    {
+                        message.AppendLine($"<b>🆔 ID</b>: <code>{dep.Id}</code>\n\n");
+                        message.AppendLine($"<b>👤 Пользователь</b>: <a href=\"tg://user?id={dep.UserId}\">{HtmlEscape(dep.Username)}</a>\n\n");
+                        message.AppendLine($"<b>💰 Сумма</b>: {dep.Amount:F2} ₽\n\n");
+                        message.AppendLine($"<b>📅 Дата</b>: {dep.Date:dd.MM.yyyy HH:mm}\n\n");
+                        message.AppendLine("▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\n");
+                    }
+                }
+
+                var keyboard = new InlineKeyboardMarkup(
+                    deposits.Select(dep => new[] { InlineKeyboardButton.WithCallbackData($"✅ Подтвердить {dep.Id} ({dep.Amount:F2} ₽)", $"confirm_deposit_{dep.Id}") })
+                    .Concat(new[] { new[] { InlineKeyboardButton.WithCallbackData("🔄 Обновить", "deposits_list"), InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") } }));
+
+                await EditOrSendMessageAsync(
+                    BotClient, chatId, messageId, message.ToString(), keyboard, cancellationToken, "deposits_list", ParseMode.Html);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка показа депозитов: {ex}");
+                await BotClient.SendMessage(
+                    chatId: chatId,
+                    text: "<b>⚠ Ошибка при загрузке списка депозитов</b>",
+                    parseMode: ParseMode.Html,
+                    cancellationToken: cancellationToken);
+            }
+        }
+
+        private static async Task ShowWithdrawalsListAsync(ITelegramBotClient botClient, long chatId, int messageId, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var withdrawals = await GetPendingWithdrawalsAsync();
+                var message = new StringBuilder("<b>💸 Ожидающие выводы</b>\n\n");
+
+                if (!withdrawals.Any())
+                {
+                    message.AppendLine("Нет ожидающих выводов.");
+                }
+                else
+                {
+                    foreach (var w in withdrawals)
+                    {
+                        message.AppendLine($"<b>🆔 ID</b>: <code>{w.Id}</code>\n\n");
+                        message.AppendLine($"<b>👤 Пользователь</b>: <a href=\"tg://user?id={w.UserId}\">{HtmlEscape(w.Username)}</a>\n\n");
+                        message.AppendLine($"<b>💰 Сумма</b>: {w.Amount:F2} ₽\n\n");
+                        message.AppendLine($"<b>📅 Дата</b>: {w.Date:dd.MM.yyyy HH:mm}\n\n");
+                        message.AppendLine("▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\n");
+                    }
+                }
+
+                var keyboard = new InlineKeyboardMarkup(
+                    withdrawals.Select(w => new[] { InlineKeyboardButton.WithCallbackData($"✅ Подтвердить {w.Id} ({w.Amount:F2} ₽)", $"confirm_withdrawal_{w.Id}") })
+                    .Concat(new[] { new[] { InlineKeyboardButton.WithCallbackData("🔄 Обновить", "withdrawals_list"), InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") } }));
+
+                await EditOrSendMessageAsync(
+                    botClient, chatId, messageId, message.ToString(), keyboard, cancellationToken, "withdrawals_list", ParseMode.Html);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка показа выводов: {ex}");
+                await botClient.SendMessage(
+                    chatId: chatId,
+                    text: "<b>⚠ Ошибка при загрузке списка выводов</b>",
+                    parseMode: ParseMode.Html,
+                    cancellationToken: cancellationToken);
+            }
+        }
+
+        private static async Task ShowPendingProofsAsync(ITelegramBotClient botClient, long chatId, int messageId, CancellationToken cancellationToken)
+        {
+            try
+            {
+                using var cmd = new SQLiteCommand(
+                    @"SELECT dp.Id, dp.DepositId, dp.TelegramId, u.Username, d.Amount, dp.FileId, dp.FileType, dp.Date 
+              FROM DepositProofs dp 
+              LEFT JOIN Users u ON dp.TelegramId = u.TelegramId
+              LEFT JOIN Deposits d ON dp.DepositId = d.Id
+              WHERE dp.Status = 'Ожидает' ORDER BY dp.Date",
+                    DbConnection);
+
+                using var reader = await cmd.ExecuteReaderAsync();
+                var message = new StringBuilder("<b>🧾 Чеки на проверку</b>\n\n");
+
+                var proofs = new List<(int Id, int DepositId, long UserId, string Username, decimal Amount, string FileId, string FileType, DateTime Date)>();
+                while (await reader.ReadAsync())
+                {
+                    proofs.Add((
+                        reader.GetInt32(0),
+                        reader.GetInt32(1),
+                        reader.GetInt64(2),
+                        reader.IsDBNull(3) ? "N/A" : reader.GetString(3),
+                        reader.GetDecimal(4),
+                        reader.GetString(5),
+                        reader.GetString(6),
+                        DateTime.Parse(reader.GetString(7))
+                    ));
+                }
+
+                if (!proofs.Any())
+                {
+                    message.AppendLine("Нет чеков на проверку.");
+                }
+
+                var keyboardRows = new List<InlineKeyboardButton[]>();
+                foreach (var proof in proofs)
+                {
+                    message.AppendLine($"<b>🆔 ID чека</b>: <code>{proof.Id}</code>\n");
+                    message.AppendLine($"<b>👤 Пользователь</b>: <a href=\"tg://user?id={proof.UserId}\">{HtmlEscape(proof.Username)}</a>\n");
+                    message.AppendLine($"<b>💰 Сумма депозита</b>: {proof.Amount:F2} ₽\n");
+                    message.AppendLine($"<b>📅 Дата</b>: {proof.Date:dd.MM.yyyy HH:mm}\n");
+                    message.AppendLine("▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n");
+
+                    keyboardRows.Add(new[]
+                    {
+                InlineKeyboardButton.WithCallbackData($"✅ Подтвердить чек {proof.Id}", $"confirm_deposit_{proof.DepositId}"),
+                InlineKeyboardButton.WithCallbackData($"❌ Отклонить чек {proof.Id}", $"reject_proof_{proof.Id}")
+            });
+
+                    try
+                    {
+                        if (proof.FileType == "photo")
+                        {
+                            await botClient.SendPhoto(
+                                chatId: chatId,
+                                photo: new InputFileId(proof.FileId),
+                                caption: $"Чек ID {proof.Id} на {proof.Amount:F2} ₽ от {HtmlEscape(proof.Username)}",
+                                cancellationToken: cancellationToken);
+                        }
+                        else
+                        {
+                            await botClient.SendDocument(
+                                chatId: chatId,
+                                document: new InputFileId(proof.FileId),
+                                caption: $"Чек ID {proof.Id} на {proof.Amount:F2} ₽ от {HtmlEscape(proof.Username)}",
+                                cancellationToken: cancellationToken);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Ошибка отправки чека: {ex}");
+                        message.AppendLine($"<b>⚠ Ошибка загрузки чека ID {proof.Id}</b>\n");
+                    }
+                }
+
+                keyboardRows.Add(new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("🔄 Обновить", "pending_proofs"),
+                    InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu")
+                });
+
+                await botClient.SendMessage(
+                    chatId: chatId,
+                    text: message.ToString(),
+                    replyMarkup: new InlineKeyboardMarkup(keyboardRows),
+                    parseMode: ParseMode.Html,
+                    cancellationToken: cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка показа чеков: {ex}");
+                await botClient.SendMessage(
+                    chatId: chatId,
+                    text: "<b>⚠ Ошибка при загрузке списка чеков</b>",
+                    parseMode: ParseMode.Html,
+                    cancellationToken: cancellationToken);
+            }
+        }
+
+
+        private static async Task ViewDepositsAsync(ITelegramBotClient botClient, long chatId, int messageId, CancellationToken cancellationToken)
+        {
+            try
+            {
+                using var cmd = new SQLiteCommand(
+                    "SELECT d.Id, d.TelegramId, u.Username, d.Amount, d.Date, d.Status " +
+                    "FROM Deposits d LEFT JOIN Users u ON d.TelegramId = u.TelegramId " +
+                    "ORDER BY d.Date DESC", DbConnection);
+                using var reader = await cmd.ExecuteReaderAsync();
+                var response = new StringBuilder("<b>📋 Список депозитов</b>\n\n");
+
+                bool hasDeposits = false;
+                while (await reader.ReadAsync())
+                {
+                    hasDeposits = true;
+                    response.AppendLine($"<b>🆔 ID</b>: <code>{reader.GetInt32(0)}</code>\n\n");
+                    response.AppendLine($"<b>👤 Пользователь</b>: <a href=\"tg://user?id={reader.GetInt64(1)}\">{HtmlEscape(reader.IsDBNull(2) ? "N/A" : reader.GetString(2))}</a>\n\n");
+                    response.AppendLine($"<b>💰 Сумма</b>: {reader.GetDecimal(3):F2} ₽\n\n");
+                    response.AppendLine($"<b>📅 Дата</b>: {DateTime.Parse(reader.GetString(4)):dd.MM.yyyy HH:mm}\n\n");
+                    response.AppendLine($"<b>📌 Статус</b>: {HtmlEscape(reader.GetString(5))}\n\n");
+                    response.AppendLine("▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\n");
+                }
+
+                if (!hasDeposits)
+                {
+                    response.AppendLine("Депозитов нет.");
+                }
+
+                var keyboard = GetAdminMenuKeyboard();
+                await EditOrSendMessageAsync(
+                    botClient, chatId, messageId, response.ToString(), keyboard, cancellationToken, "view_deposits", ParseMode.Html);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка при получении списка депозитов: {ex}");
+                await botClient.SendMessage(
+                    chatId: chatId,
+                    text: "<b>⚠ Ошибка при получении списка депозитов.</b>",
+                    parseMode: ParseMode.Html,
+                    cancellationToken: cancellationToken);
+            }
+        }
+
+        private static async Task ViewWithdrawalsAsync(ITelegramBotClient botClient, long chatId, int messageId, CancellationToken cancellationToken)
+        {
+            try
+            {
+                using var cmd = new SQLiteCommand(
+                    "SELECT w.Id, w.TelegramId, u.Username, w.Amount, w.Date, w.Status " +
+                    "FROM Withdrawals w LEFT JOIN Users u ON w.TelegramId = u.TelegramId " +
+                    "ORDER BY w.Date DESC", DbConnection);
+                using var reader = await cmd.ExecuteReaderAsync();
+                var response = new StringBuilder("<b>💸 Последние выводы</b>\n\n");
+
+                bool hasWithdrawals = false;
+                while (await reader.ReadAsync())
+                {
+                    hasWithdrawals = true;
+                    response.AppendLine($"<b>🆔 ID</b>: <code>{reader.GetInt32(0)}</code>\n\n");
+                    response.AppendLine($"<b>👤 Пользователь</b>: <a href=\"tg://user?id={reader.GetInt64(1)}\">{HtmlEscape(reader.IsDBNull(2) ? "N/A" : reader.GetString(2))}</a>\n\n");
+                    response.AppendLine($"<b>💰 Сумма</b>: {reader.GetDecimal(3):F2} ₽\n\n");
+                    response.AppendLine($"<b>📅 Дата</b>: {DateTime.Parse(reader.GetString(4)):dd.MM.yyyy HH:mm}\n\n");
+                    response.AppendLine($"<b>📌 Статус</b>: {HtmlEscape(reader.GetString(5))}\n\n");
+                    response.AppendLine("▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\n");
+                }
+
+                if (!hasWithdrawals)
+                {
+                    response.AppendLine("Выводов нет.");
+                }
+
+                var keyboard = new InlineKeyboardMarkup(new[]
+                {
+                    new[] { InlineKeyboardButton.WithCallbackData("🔄 Обновить", "view_withdrawals") },
+                    new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }
+                });
+
+                await EditOrSendMessageAsync(
+                    botClient, chatId, messageId, response.ToString(), keyboard, cancellationToken, "view_withdrawals", ParseMode.Html);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка при получении списка выводов: {ex}");
+                await botClient.SendMessage(
+                    chatId: chatId,
+                    text: "<b>⚠ Ошибка при получении списка выводов.</b>",
+                    parseMode: ParseMode.Html,
+                    cancellationToken: cancellationToken);
+            }
+        }
+
+        private static async Task ViewReferralsAsync(ITelegramBotClient botClient, long chatId, int messageId, CancellationToken cancellationToken)
+        {
+            try
+            {
+                using var cmd = new SQLiteCommand(
+                    "SELECT r.Id, r.ReferrerId, r.RefereeId, u1.Username AS ReferrerUsername, u2.Username AS RefereeUsername, r.Bonus, r.Date " +
+                    "FROM Referrals r " +
+                    "LEFT JOIN Users u1 ON r.ReferrerId = u1.TelegramId " +
+                    "LEFT JOIN Users u2 ON r.RefereeId = u2.TelegramId " +
+                    "ORDER BY r.Date DESC", DbConnection);
+                using var reader = await cmd.ExecuteReaderAsync();
+                var response = new StringBuilder("<b>🤝 Список рефералов</b>\n\n");
+
+                bool hasReferrals = false;
+                while (await reader.ReadAsync())
+                {
+                    hasReferrals = true;
+                    response.AppendLine($"<b>🆔 ID</b>: <code>{reader.GetInt32(0)}</code>\n\n");
+                    response.AppendLine($"<b>👤 Реферер</b>: <a href=\"tg://user?id={reader.GetInt64(1)}\">{HtmlEscape(reader.IsDBNull(3) ? "N/A" : reader.GetString(3))}</a>\n\n");
+                    response.AppendLine($"<b>👤 Реферал</b>: <a href=\"tg://user?id={reader.GetInt64(2)}\">{HtmlEscape(reader.IsDBNull(4) ? "N/A" : reader.GetString(4))}</a>\n\n");
+                    response.AppendLine($"<b>💰 Бонус</b>: {reader.GetDecimal(5):F2} ₽\n\n");
+                    response.AppendLine($"<b>📅 Дата</b>: {DateTime.Parse(reader.GetString(6)):dd.MM.yyyy HH:mm}\n\n");
+                    response.AppendLine("▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\n");
+                }
+
+                if (!hasReferrals)
+                {
+                    response.AppendLine("Рефералов нет.");
+                }
+
+                var keyboard = new InlineKeyboardMarkup(new[]
+                {
+                    new[] { InlineKeyboardButton.WithCallbackData("🔄 Обновить", "view_referrals") },
+                    new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }
+                });
+
+                await EditOrSendMessageAsync(
+                    botClient, chatId, messageId, response.ToString(), keyboard, cancellationToken, "view_referrals", ParseMode.Html);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка при получении списка рефералов: {ex}");
+                await botClient.SendMessage(
+                    chatId: chatId,
+                    text: "<b>⚠ Ошибка при получении списка рефералов.</b>",
+                    parseMode: ParseMode.Html,
+                    cancellationToken: cancellationToken);
+            }
+        }
+
+        #endregion
+
+        #region Processing Methods
+
+        private static async Task ProcessRequisiteAsync(long chatId, string text, int messageId, CancellationToken cancellationToken)
+        {
+            var parts = text.Split('|');
+            if (parts.Length == 3 && (parts[0].Trim() == "card" || parts[0].Trim() == "crypto"))
+            {
+                using var cmd = new SQLiteCommand(
+                    "INSERT INTO Requisites (Type, BankOrCoin, Details, DateAdded) VALUES (@type, @bank, @details, @date)",
+                    DbConnection);
+                cmd.Parameters.AddWithValue("@type", parts[0].Trim());
+                cmd.Parameters.AddWithValue("@bank", parts[1].Trim());
+                cmd.Parameters.AddWithValue("@details", parts[2].Trim());
+                cmd.Parameters.AddWithValue("@date", DateTime.UtcNow.ToString("o"));
+                await cmd.ExecuteNonQueryAsync();
+
+                await ShowRequisitesMenuAsync(chatId, messageId, cancellationToken);
+                UserStates.Remove(chatId);
+            }
+            else
+            {
+                await EditOrSendMessageAsync(
+                    BotClient, chatId, messageId,
+                    """
+                    <b>❌ Неверный формат.</b> Используйте:\n\n
+                    <code>тип|банк|монета|реквизиты</code>\n\n
+                    Пример: <code>card Сбербанк 1234567890123456</code>
+                    """,
+                    new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 Назад", "requisites_menu")),
+                    cancellationToken, "requisite_error", ParseMode.Html);
+            }
+        }
+
+        private static async Task ProcessEditRequisiteAsync(long chatId, string text, int messageId, string state, CancellationToken cancellationToken)
+        {
+            var editId = int.Parse(state.Split('_')[2]);
+            var parts = text.Split('|');
+
+            if (parts.Length == 3 && (parts[0].Trim() == "card" || parts[0].Trim() == "crypto"))
+            {
+                using var cmd = new SQLiteCommand(
+                    "UPDATE Requisites SET Type = @type, BankOrCoin = @bank, Details = @details WHERE Id = @id",
+                    DbConnection);
+                cmd.Parameters.AddWithValue("@type", parts[0].Trim());
+                cmd.Parameters.AddWithValue("@bank", parts[1].Trim());
+                cmd.Parameters.AddWithValue("@details", parts[2].Trim());
+                cmd.Parameters.AddWithValue("@id", editId);
+                await cmd.ExecuteNonQueryAsync();
+
+                await ShowRequisiteDetailsAsync(chatId, messageId, editId, cancellationToken);
+                UserStates.Remove(chatId);
+            }
+            else
+            {
+                await EditOrSendMessageAsync(
+                    BotClient, chatId, messageId,
+                    "<b>❌ Неверный формат.</b> Попробуйте снова:\n\n<code>тип|банк/монета|реквизиты</code>",
+                    new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 Отмена", $"requisite_detail_{editId}")),
+                    cancellationToken, "edit_requisite_error", ParseMode.Html);
+            }
+        }
+        private static async Task ProcessBlockUserAsync(long chatId, string text, int messageId, CancellationToken cancellationToken)
+        {
+            if (!long.TryParse(text, out long userId))
+            {
+                await EditOrSendMessageAsync(
+                    BotClient, chatId, messageId,
+                    "<b>❌ Неверный формат ID.</b> Введите числовой Telegram ID:",
+                    new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }),
+                    cancellationToken, "block_user_error", ParseMode.Html);
+                return;
+            }
+
+            using var cmd = new SQLiteCommand(
+                "UPDATE Users SET IsBlocked = 1 WHERE TelegramId = @id", DbConnection);
+            cmd.Parameters.AddWithValue("@id", userId);
+            var rowsAffected = await cmd.ExecuteNonQueryAsync();
+
+            if (rowsAffected == 0)
+            {
+                await EditOrSendMessageAsync(
+                    BotClient, chatId, messageId,
+                    "<b>⚠ Пользователь не найден.</b>",
+                    new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }),
+                    cancellationToken, "block_user_error", ParseMode.Html);
+                return;
+            }
+
+            await BotClient.SendMessage(
+                chatId: userId,
+                text: "<b>🔒 Ваш аккаунт заблокирован администратором.</b>",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+
+            await EditOrSendMessageAsync(
+                BotClient, chatId, messageId,
+                $"<b>✅ Пользователь {userId} заблокирован.</b>",
+                new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }),
+                cancellationToken, "block_user_success", ParseMode.Html);
+            UserStates.Remove(chatId);
+        }
+
+        private static async Task ProcessUnblockUserAsync(long chatId, string text, int messageId, CancellationToken cancellationToken)
+        {
+            if (!long.TryParse(text, out long userId))
+            {
+                await EditOrSendMessageAsync(
+                    BotClient, chatId, messageId,
+                    "<b>❌ Неверный формат ID.</b> Введите числовой Telegram ID:",
+                    new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }),
+                    cancellationToken, "unblock_user_error", ParseMode.Html);
+                return;
+            }
+
+            using var cmd = new SQLiteCommand(
+                "UPDATE Users SET IsBlocked = 0 WHERE TelegramId = @id", DbConnection);
+            cmd.Parameters.AddWithValue("@id", userId);
+            var rowsAffected = await cmd.ExecuteNonQueryAsync();
+
+            if (rowsAffected == 0)
+            {
+                await EditOrSendMessageAsync(
+                    BotClient, chatId, messageId,
+                    "<b>⚠ Пользователь не найден.</b>",
+                    new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }),
+                    cancellationToken, "unblock_user_error", ParseMode.Html);
+                return;
+            }
+
+            await BotClient.SendMessage(
+                chatId: userId,
+                text: "<b>🔓 Ваш аккаунт разблокирован администратором.</b>",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+
+            await EditOrSendMessageAsync(
+                BotClient, chatId, messageId,
+                $"<b>✅ Пользователь {userId} разблокирован.</b>",
+                new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }),
+                cancellationToken, "unblock_user_success", ParseMode.Html);
+            UserStates.Remove(chatId);
+        }
+        private static async Task ProcessDepositAsync(string text, long chatId, int messageId, CancellationToken cancellationToken)
+        {
+            // Логируем входной текст для отладки
+            Console.WriteLine($"[ProcessDepositAsync] Введённый текст: {text} (chatId: {chatId})");
+
+            // Проверяем сумму
+            string errorMessage;
+            if (!decimal.TryParse(text.Replace(" ", "").Replace(",", "."), NumberStyles.Any, CultureInfo.InvariantCulture, out var amount))
+            {
+                errorMessage = "<b>❗ Ошибка</b>\n\nСумма должна быть числом (например, 15000 или 15000.50). Попробуйте снова.";
+                Console.WriteLine($"[ProcessDepositAsync] Ошибка: Некорректная сумма ({text})");
+            }
+            else if (amount < 10000)
+            {
+                errorMessage = "<b>❗ Ошибка</b>\n\nМинимальная сумма депозита — 10000 ₽. Введите большую сумму.";
+                Console.WriteLine($"[ProcessDepositAsync] Ошибка: Сумма меньше 10000 ({amount})");
+            }
+            else
+            {
+                // Получаем последние реквизиты из таблицы Requisites
+                string type = "card";
+                string bankOrCoin = "Сбербанк";
+                string details = "1234 5678 9012 3456"; // Значения по умолчанию
+                try
+                {
+                    using (var reqCmd = new SQLiteCommand(
+                        "SELECT Type, BankOrCoin, Details FROM Requisites ORDER BY Id DESC LIMIT 1", DbConnection))
+                    {
+                        using var reader = await reqCmd.ExecuteReaderAsync(cancellationToken);
+                        if (await reader.ReadAsync())
+                        {
+                            type = reader.GetString(0);
+                            bankOrCoin = reader.GetString(1);
+                            details = reader.GetString(2);
+                        }
+                        else
+                        {
+                            Console.WriteLine("[ProcessDepositAsync] Ошибка: Реквизиты не найдены в таблице Requisites.");
+                            errorMessage = "<b>❗ Ошибка</b>\n\nРеквизиты для депозита не настроены. Обратитесь к поддержке.";
+                            await EditOrSendMessageAsync(
+                                BotClient, chatId, messageId,
+                                errorMessage,
+                                new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 Назад", "my_deposit")),
+                                cancellationToken, "deposit_error", ParseMode.Html, forceNewMessage: true, ignoreLastMessageId: true);
+                            return;
+                        }
+                    }
+                }
+                catch (SQLiteException ex)
+                {
+                    Console.WriteLine($"[ProcessDepositAsync] Ошибка получения реквизитов: {ex.Message}");
+                    errorMessage = "<b>❗ Ошибка</b>\n\nОшибка сервера при получении реквизитов. Обратитесь к поддержке.";
+                    await EditOrSendMessageAsync(
+                        BotClient, chatId, messageId,
+                        errorMessage,
+                        new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 Назад", "my_deposit")),
+                        cancellationToken, "deposit_error", ParseMode.Html, forceNewMessage: true, ignoreLastMessageId: true);
+                    return;
+                }
+
+                // Сохраняем депозит в таблице Deposits
+                long depositId;
+                using (var insertCmd = new SQLiteCommand(
+                    "INSERT INTO Deposits (TelegramId, Amount, Status, Date) VALUES (@id, @amount, 'Ожидает', @date)",
+                    DbConnection))
+                {
+                    insertCmd.Parameters.AddWithValue("@id", chatId);
+                    insertCmd.Parameters.AddWithValue("@amount", amount);
+                    insertCmd.Parameters.AddWithValue("@date", DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss"));
+                    await insertCmd.ExecuteNonQueryAsync(cancellationToken);
+                    depositId = DbConnection.LastInsertRowId;
+                }
+
+                // Устанавливаем состояние waiting_deposit_proof
+                UserStates[chatId] = "waiting_deposit_proof";
+
+                // Получаем имя пользователя для уведомления
+                string username = await GetUsernameAsync(chatId) ?? chatId.ToString();
+
+                // Отправляем пользователю сообщение с реквизитами
+                await EditOrSendMessageAsync(
+                    BotClient, chatId, messageId,
+                    $"""
+            <b>💳 Подтверждение депозита</b>
+            Сумма: {amount:F2} ₽
+            Реквизиты для перевода:
+            • <b>Банк/монета: {bankOrCoin} </b>
+            • <b>Реквизиты: {details} </b>
+            Пожалуйста, отправьте фото или PDF чека о переводе.
+            <b>Чек должен содержать:</b>
+            • Сумму перевода ({amount:F2} ₽)
+            • Реквизиты получателя
+            • Дату и время перевода
+            """,
+                    new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 Назад", "my_deposit")),
+                    cancellationToken, "deposit", ParseMode.Html, forceNewMessage: true, ignoreLastMessageId: true);
+
+                // Уведомляем администраторов
+                foreach (var adminChatId in AdminIds)
+                {
+                    try
+                    {
+                        await BotClient.SendMessage(
+                            adminChatId,
+                            $"""
+                    <b>🔔 Новый депозит</b>
+                    Пользователь: @{username} ({chatId})
+                    Сумма: {amount:F2} ₽
+                    Реквизиты: {type} | {bankOrCoin} | {details}
+                    Ожидается чек.
+                    """,
+                            parseMode: ParseMode.Html,
+                            cancellationToken: cancellationToken);
+                    }
+                    catch (Telegram.Bot.Exceptions.ApiRequestException ex) when (ex.Message.Contains("chat not found"))
+                    {
+                        Console.WriteLine($"[ProcessDepositAsync] Ошибка: Не удалось отправить уведомление админу {adminChatId}: {ex.Message}");
+                    }
+                }
+                return;
+            }
+
+            // Отправляем сообщение об ошибке
+            await EditOrSendMessageAsync(
+                BotClient, chatId, messageId,
+                errorMessage,
+                new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 Назад", "my_deposit")),
+                cancellationToken, "deposit_error", ParseMode.Html, forceNewMessage: true, ignoreLastMessageId: true);
+        }
+
+        private static async Task ProcessWithdrawAsync(string text, long chatId, int messageId, CancellationToken cancellationToken)
+        {
+            // Логируем входной текст для отладки
+            Console.WriteLine($"[ProcessWithdrawAsync] Введённый текст: {text} (chatId: {chatId})");
+
+            // Разбиваем входной текст
+            var parts = text.Split('|', StringSplitOptions.TrimEntries);
+            string errorMessage;
+
+            // Проверяем формат ввода
+            if (parts.Length != 4)
+            {
+                errorMessage = "<b>❗ Ошибка</b>\n\nНеверный формат ввода. Используйте: <code>сумма|тип|банк/монета|реквизиты</code>\nПример: <code>15000|card|Сбербанк|1234 5678 9012 3456</code>";
+                Console.WriteLine($"[ProcessWithdrawAsync] Ошибка: Неверное количество частей ({parts.Length})");
+            }
+            else if (!decimal.TryParse(parts[0].Replace(" ", "").Replace(",", "."), NumberStyles.Any, CultureInfo.InvariantCulture, out var amount))
+            {
+                errorMessage = "<b>❗ Ошибка</b>\n\nСумма должна быть числом (например, 15000 или 15000.50). Попробуйте снова.";
+                Console.WriteLine($"[ProcessWithdrawAsync] Ошибка: Некорректная сумма ({parts[0]})");
+            }
+            else if (amount < 1000)
+            {
+                errorMessage = "<b>❗ Ошибка</b>\n\nМинимальная сумма вывода — 1000 ₽. Введите большую сумму.";
+                Console.WriteLine($"[ProcessWithdrawAsync] Ошибка: Сумма меньше 1000 ({amount})");
+            }
+            else if (!new[] { "card", "crypto" }.Contains(parts[1].ToLower()))
+            {
+                errorMessage = "<b>❗ Ошибка</b>\n\nТип должен быть 'card' или 'crypto'. Попробуйте снова.";
+                Console.WriteLine($"[ProcessWithdrawAsync] Ошибка: Некорректный тип ({parts[1]})");
+            }
+            else
+            {
+                // Проверяем баланс пользователя
+                decimal balance = 0;
+                using (var balanceCmd = new SQLiteCommand(
+                    "SELECT Balance FROM Users WHERE TelegramId = @id", DbConnection))
+                {
+                    balanceCmd.Parameters.AddWithValue("@id", chatId);
+                    var result = await balanceCmd.ExecuteScalarAsync(cancellationToken);
+                    balance = result is DBNull ? 0 : Convert.ToDecimal(result);
+                }
+
+                if (amount > balance)
+                {
+                    errorMessage = "<b>❗ Ошибка</b>\n\nНедостаточно средств на балансе. Ваш баланс: {balance:F2} ₽.";
+                    Console.WriteLine($"[ProcessWithdrawAsync] Ошибка: Недостаточно средств (amount: {amount}, balance: {balance})");
+                }
+                else
+                {
+                    // Создаём запись о запросе на вывод
+                    long withdrawalId;
+                    using (var insertCmd = new SQLiteCommand(
+                        "INSERT INTO Withdrawals (TelegramId, Amount, Requisites, Status, CreatedAt) VALUES (@id, @amount, @requisites, 'Ожидает', @createdAt)",
+                        DbConnection))
+                    {
+                        insertCmd.Parameters.AddWithValue("@id", chatId);
+                        insertCmd.Parameters.AddWithValue("@amount", amount);
+                        insertCmd.Parameters.AddWithValue("@requisites", $"{parts[1]}|{parts[2]}|{parts[3]}");
+                        insertCmd.Parameters.AddWithValue("@createdAt", DateTime.UtcNow);
+                        await insertCmd.ExecuteNonQueryAsync(cancellationToken);
+                        withdrawalId = DbConnection.LastInsertRowId;
+                    }
+
+                    // Отправляем уведомление администратору
+                    using (var adminCmd = new SQLiteCommand(
+                        "SELECT TelegramId FROM Users WHERE IsAdmin = 1", DbConnection))
+                    {
+                        using var reader = await adminCmd.ExecuteReaderAsync(cancellationToken);
+                        while (await reader.ReadAsync())
+                        {
+                            long adminChatId = reader.GetInt64(0);
+                            await BotClient.SendMessage(
+                                adminChatId,
+                                $"""
+                                <b>🔔 Новый запрос на вывод</b>
+                                Пользователь: {chatId}
+                                Сумма: {amount:F2} ₽
+                                Реквизиты: {parts[1]} | {parts[2]} | {parts[3]}
+                                Подтвердите или отмените:
+                                """,
+                                replyMarkup: new InlineKeyboardMarkup(new[]
+                                {
+                            InlineKeyboardButton.WithCallbackData("✅ Подтвердить", $"confirm_withdrawal|{withdrawalId}"),
+                            InlineKeyboardButton.WithCallbackData("❌ Отменить", $"cancel_withdrawal|{withdrawalId}")
+                                }),
+                                parseMode: ParseMode.Html,
+                                cancellationToken: cancellationToken);
+                        }
+                    }
+
+                    // Отправляем пользователю подтверждение
+                    await EditOrSendMessageAsync(
+                        BotClient, chatId, messageId,
+                        $"""
+                        <b>💸 Запрос на вывод</b>
+                        Сумма: {amount:F2} ₽
+                        Реквизиты: {parts[1]} | {parts[2]} | {parts[3]}
+                        Ваш запрос отправлен на рассмотрение. Ожидайте подтверждения.
+                        """,
+                        new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 Назад", "main_menu")),
+                        cancellationToken, "withdraw", ParseMode.Html, forceNewMessage: true, ignoreLastMessageId: true);
+                    return;
+                }
+            }
+
+            // Отправляем сообщение об ошибке
+            await EditOrSendMessageAsync(
+                BotClient, chatId, messageId,
+                errorMessage,
+                new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 Назад", "main_menu")),
+                cancellationToken, "withdraw_error", ParseMode.Html, forceNewMessage: true, ignoreLastMessageId: true);
+        }
+        private static async Task ProcessCancelDepositAsync(long chatId, string text, int messageId, CancellationToken cancellationToken)
+        {
+            if (!int.TryParse(text, out int depositId))
+            {
+                await EditOrSendMessageAsync(
+                    BotClient, chatId, messageId,
+                    "<b>❌ Неверный формат ID депозита.</b> Введите числовой ID:",
+                    new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }),
+                    cancellationToken, "cancel_deposit_error", ParseMode.Html);
+                return;
+            }
+
+            var deposit = await GetDepositByIdAsync(depositId);
+            if (deposit == null || deposit.Status != "Ожидает")
+            {
+                await EditOrSendMessageAsync(
+                    BotClient, chatId, messageId,
+                    "<b>⚠ Ошибка</b>\n\nДепозит не найден или уже обработан.",
+                    new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }),
+                    cancellationToken, "cancel_deposit_error", ParseMode.Html);
+                return;
+            }
+
+            using var cmd = new SQLiteCommand(
+                "UPDATE Deposits SET Status = 'Отменён' WHERE Id = @id", DbConnection);
+            cmd.Parameters.AddWithValue("@id", depositId);
+            await cmd.ExecuteNonQueryAsync();
+
+            await BotClient.SendMessage(
+                chatId: deposit.UserId,
+                text: $"<b>❌ Ваш депозит на {deposit.Amount:F2} ₽ был отменён.</b>",
+                parseMode: ParseMode.Html,
+                cancellationToken: cancellationToken);
+
+            await ShowDepositsListAsync(chatId, messageId, cancellationToken);
+            UserStates.Remove(chatId);
+        }
+        private static async Task ProcessConfirmDepositAsync(long chatId, string text, int messageId, CancellationToken cancellationToken)
+        {
+            if (!int.TryParse(text, out int depositId))
+            {
+                await EditOrSendMessageAsync(
+                    BotClient, chatId, messageId,
+                    "<b>❌ Неверный формат ID депозита.</b> Введите числовой ID:",
+                    new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }),
+                    cancellationToken, "confirm_deposit_error", ParseMode.Html);
+                return;
+            }
+            await ConfirmDepositAsync(chatId, depositId, messageId, cancellationToken);
+        }
+
+        private static async Task ProcessConfirmWithdrawalAsync(long chatId, string text, int messageId, CancellationToken cancellationToken)
+        {
+            await ConfirmWithdrawalAsync(chatId, text, messageId, cancellationToken);
+        }
+
+        private static async Task ProcessCalculatorCustomAsync(long chatId, string text, int messageId, CancellationToken cancellationToken)
+        {
+            var keyboard = new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "calculator") });
+            var parts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length != 2 || !decimal.TryParse(parts[0], out var amount) || !int.TryParse(parts[1], out var weeks) || amount < 10000 || weeks <= 0)
+            {
+                await EditOrSendMessageAsync(
+                    BotClient, chatId, messageId,
+                    """
+                    <b>❗ Ошибка</b>\n\n
+                    Формат: сумма (мин. 10,000 ₽) и количество недель (через пробел, например: 15000 8).\n\n
+                    Попробуйте снова:
+                    """,
+                    new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "calculator") }),
+                    cancellationToken,
+                    "calculator_custom_error",
+                    ParseMode.Html,
+                    forceNewMessage: true,
+                    ignoreLastMessageId: true);
+                return;
+            }
+
+            var resultText = await CalculateProfitAsync(amount, weeks);
+            await EditOrSendMessageAsync(
+                BotClient, chatId, messageId,
+                resultText,
+                new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "calculator") }),
+                cancellationToken,
+                $"calculator_result_{amount}_{weeks}",
+                ParseMode.Html,
+                forceNewMessage: true);
+        }
+
+        private static async Task ConfirmDepositAsync(long chatId, int depositId, int messageId, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var deposit = await GetDepositByIdAsync(depositId);
+                if (deposit == null || deposit.Status != "Ожидает")
+                {
+                    await EditOrSendMessageAsync(
+                        BotClient, chatId, messageId,
+                        "<b>⚠ Ошибка</b>\n\nДепозит не найден или уже обработан.",
+                        new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }),
+                        cancellationToken, "confirm_deposit_error", ParseMode.Html);
+                    return;
+                }
+
+                using var transaction = DbConnection.BeginTransaction();
+                try
+                {
+                    // Обновляем статус депозита
+                    using var cmd = new SQLiteCommand(
+                        "UPDATE Deposits SET Status = 'Подтверждён' WHERE Id = @id", DbConnection);
+                    cmd.Parameters.AddWithValue("@id", depositId);
+                    await cmd.ExecuteNonQueryAsync(cancellationToken);
+
+                    // Обновляем баланс пользователя
+                    cmd.CommandText = @"UPDATE Users 
+                SET Deposit = Deposit + @amount, 
+                    Status = CASE 
+                        WHEN Deposit + @amount >= 100000 THEN 'Кит'
+                        WHEN Deposit + @amount >= 50000 THEN 'Профи'
+                        ELSE 'Новичок'
+                    END
+                WHERE TelegramId = @userId";
+                    cmd.Parameters.Clear();
+                    cmd.Parameters.AddWithValue("@amount", deposit.Amount);
+                    cmd.Parameters.AddWithValue("@userId", deposit.UserId);
+                    await cmd.ExecuteNonQueryAsync(cancellationToken);
+
+                    // Начисляем реферальный бонус
+                    long? referrerId = null;
+                    using (var getReferrerCmd = new SQLiteCommand(
+                        "SELECT ReferrerId FROM Referrals WHERE RefereeId = @id",
+                        DbConnection))
+                    {
+                        getReferrerCmd.Parameters.AddWithValue("@id", deposit.UserId);
+                        var result = await getReferrerCmd.ExecuteScalarAsync(cancellationToken);
+                        if (result != null && result != DBNull.Value)
+                        {
+                            referrerId = Convert.ToInt64(result);
+                        }
+                    }
+
+                    if (referrerId.HasValue)
+                    {
+                        // Проверяем, есть ли уже подтверждённые депозиты у реферала
+                        using (var checkDepositCmd = new SQLiteCommand(
+                            "SELECT COUNT(*) FROM Deposits WHERE TelegramId = @refereeId AND Status = 'Подтверждён' AND Id != @depositId",
+                            DbConnection))
+                        {
+                            checkDepositCmd.Parameters.AddWithValue("@refereeId", deposit.UserId);
+                            checkDepositCmd.Parameters.AddWithValue("@depositId", depositId);
+                            var depositCount = Convert.ToInt32(await checkDepositCmd.ExecuteScalarAsync(cancellationToken));
+
+                            // Начисляем бонус только если это первый подтверждённый депозит
+                            if (depositCount == 0)
+                            {
+                                // Определяем процент бонуса
+                                int referralCount;
+                                using (var countCmd = new SQLiteCommand(
+                                    "SELECT COUNT(*) FROM Referrals WHERE ReferrerId = @referrerId",
+                                    DbConnection))
+                                {
+                                    countCmd.Parameters.AddWithValue("@referrerId", referrerId.Value);
+                                    referralCount = Convert.ToInt32(await countCmd.ExecuteScalarAsync(cancellationToken));
+                                }
+
+                                decimal bonusRate = referralCount >= 5 ? 0.02m : 0.01m;
+                                decimal bonus = deposit.Amount * bonusRate;
+
+                                // Обновляем бонус
+                                using (var updateBonusCmd = new SQLiteCommand(
+                                    "UPDATE Referrals SET Bonus = COALESCE(Bonus, 0) + @bonus WHERE RefereeId = @id AND ReferrerId = @referrerId",
+                                    DbConnection))
+                                {
+                                    updateBonusCmd.Parameters.AddWithValue("@bonus", bonus);
+                                    updateBonusCmd.Parameters.AddWithValue("@id", deposit.UserId);
+                                    updateBonusCmd.Parameters.AddWithValue("@referrerId", referrerId.Value);
+                                    await updateBonusCmd.ExecuteNonQueryAsync(cancellationToken);
+                                }
+
+                                Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}] Начислен бонус {bonus:F2} ₽ рефереру {referrerId} за депозит {deposit.Amount:F2} ₽ от {deposit.UserId}");
+                            }
+                        }
+                    }
+
+                    // Обновляем статус чеков, связанных с депозитом
+                    using (var updateProofCmd = new SQLiteCommand(
+                        "UPDATE DepositProofs SET Status = 'Подтверждён' WHERE DepositId = @depositId",
+                        DbConnection))
+                    {
+                        updateProofCmd.Parameters.AddWithValue("@depositId", depositId);
+                        await updateProofCmd.ExecuteNonQueryAsync(cancellationToken);
+                    }
+
+                    transaction.Commit();
+
+                    // Уведомляем пользователя
+                    await BotClient.SendMessage(
+                        chatId: deposit.UserId,
+                        text: $"<b>✅ Ваш депозит на {deposit.Amount:F2} ₽ подтверждён!</b>",
+                        parseMode: ParseMode.Html,
+                        cancellationToken: cancellationToken);
+
+                    await ShowDepositPageAsync(BotClient, deposit.UserId, 0, cancellationToken);
+                    await ShowDepositsListAsync(chatId, messageId, cancellationToken);
+                    UserStates.Remove(chatId);
+                }
+                catch (Exception)
+                {
+                    transaction.Rollback();
+                    throw;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}] Ошибка подтверждения депозита: {ex}");
+                await EditOrSendMessageAsync(
+                    BotClient, chatId, messageId,
+                    "<b>⚠ Ошибка при подтверждении депозита</b>",
+                    new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }),
+                    cancellationToken, "confirm_deposit_error", ParseMode.Html);
+            }
+        }
+
+        private static async Task ConfirmWithdrawalAsync(long chatId, string withdrawalIdText, int messageId, CancellationToken cancellationToken)
+        {
+            try
+            {
+                if (!int.TryParse(withdrawalIdText, out int withdrawalId))
+                {
+                    await EditOrSendMessageAsync(
+                        BotClient, chatId, messageId,
+                        "<b>❌ Неверный формат ID вывода.</b> Введите числовой ID:",
+                        new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }),
+                        cancellationToken, "confirm_withdrawal_error", ParseMode.Html);
+                    return;
+                }
+
+                var withdrawal = await GetWithdrawalByIdAsync(withdrawalId);
+                if (withdrawal == null || withdrawal.Status != "Ожидает")
+                {
+                    await EditOrSendMessageAsync(
+                        BotClient, chatId, messageId,
+                        "<b>⚠ Ошибка</b>\n\nЗапрос на вывод не найден или уже обработан.",
+                        new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }),
+                        cancellationToken, "confirm_withdrawal_error", ParseMode.Html);
+                    return;
+                }
+
+                var (deposit, interest, _) = await GetUserInfoAsync(withdrawal.UserId);
+                if (withdrawal.Amount > deposit + interest)
+                {
+                    await EditOrSendMessageAsync(
+                        BotClient, chatId, messageId,
+                        "<b>⚠ Ошибка</b>\n\nНедостаточно средств у пользователя.",
+                        new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }),
+                        cancellationToken, "confirm_withdrawal_error", ParseMode.Html);
+                    return;
+                }
+
+                using var cmd = new SQLiteCommand(
+                    "UPDATE Withdrawals SET Status = 'Подтверждён' WHERE Id = @id", DbConnection);
+                cmd.Parameters.AddWithValue("@id", withdrawalId);
+                await cmd.ExecuteNonQueryAsync();
+
+                cmd.CommandText = "UPDATE Users SET Deposit = Deposit - @amount WHERE TelegramId = @userId";
+                cmd.Parameters.Clear();
+                cmd.Parameters.AddWithValue("@amount", withdrawal.Amount);
+                cmd.Parameters.AddWithValue("@userId", withdrawal.UserId);
+                await cmd.ExecuteNonQueryAsync();
+
+                await BotClient.SendMessage(
+                    chatId: withdrawal.UserId,
+                    text: $"<b>✅ Ваш запрос на вывод {withdrawal.Amount:F2} ₽ подтверждён!</b>",
+                    parseMode: ParseMode.Html,
+                    cancellationToken: cancellationToken);
+
+                await ShowDepositPageAsync(BotClient, withdrawal.UserId, 0, cancellationToken);
+                await ShowWithdrawalsListAsync(BotClient, chatId, messageId, cancellationToken);
+                UserStates.Remove(chatId);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка подтверждения вывода: {ex}");
+                await EditOrSendMessageAsync(
+                    BotClient, chatId, messageId,
+                    "<b>⚠ Ошибка при подтверждении вывода</b>",
+                    new InlineKeyboardMarkup(new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "admin_menu") }),
+                    cancellationToken, "confirm_withdrawal_error", ParseMode.Html);
+            }
+        }
+
+        #endregion
+
+        #region Helper Methods
+
+        private static async Task<Withdrawal> GetWithdrawalByIdAsync(int id)
+        {
+            using var cmd = new SQLiteCommand(
+                "SELECT w.Id, w.TelegramId, u.Username, w.Amount, w.Date, w.Status " +
+                "FROM Withdrawals w LEFT JOIN Users u ON w.TelegramId = u.TelegramId " +
+                "WHERE w.Id = @id", DbConnection);
+            cmd.Parameters.AddWithValue("@id", id);
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (await reader.ReadAsync())
+            {
+                return new Withdrawal
+                {
+                    Id = reader.GetInt32(0),
+                    UserId = reader.GetInt64(1),
+                    Username = reader.IsDBNull(2) ? "N/A" : reader.GetString(2),
+                    Amount = reader.GetDecimal(3),
+                    Date = DateTime.Parse(reader.GetString(4)),
+                    Status = reader.GetString(5)
+                };
+            }
+            return null;
+        }
+
+        private static async Task<bool> CanWithdrawAsync(long chatId)
+        {
+            var lastDepositDate = await GetLastDepositDateAsync(chatId);
+            if (!lastDepositDate.HasValue) return false;
+            return DateTime.UtcNow >= lastDepositDate.Value.AddDays(7);
+        }
+
+        private static async Task<string> CalculateProfitAsync(decimal amount, int weeks)
+        {
+            decimal rate = amount >= 50000 ? 0.06m : 0.05m;
+            decimal profit = amount * rate * weeks;
+            return $"""
+                <b>📊 Результат расчёта</b>
+                <b>Сумма депозита</b>: {amount:F2} ₽
+                <b>Срок</b>: {weeks} недель
+                <b>Ставка</b>: {(rate * 100):F0}%
+                <b>Прибыль</b>: {profit:F2} ₽
+                <b>Итоговая сумма</b>: {(amount + profit):F2} ₽
+                """;
+        }
+
+        private static async Task CalculateInterestAsync()
+        {
+            try
+            {
+                using var cmd = new SQLiteCommand(
+                    "SELECT TelegramId, Deposit, ReferralCount FROM Users WHERE Deposit > 0", DbConnection);
+                using var reader = await cmd.ExecuteReaderAsync();
+                var users = new List<(long UserId, decimal Deposit, int ReferralCount)>();
+
+                while (await reader.ReadAsync())
+                {
+                    users.Add((
+                        reader.GetInt64(0),
+                        reader.GetDecimal(1),
+                        reader.GetInt32(2)
+                    ));
+                }
+
+                foreach (var user in users)
+                {
+                    decimal rate = user.Deposit >= 50000 ? 0.06m : 0.05m;
+                    decimal interest = user.Deposit * rate;
+                    decimal referralBonus = user.ReferralCount >= 5 ? user.Deposit * 0.02m : user.Deposit * 0.01m;
+
+                    using var updateCmd = new SQLiteCommand(
+                        "UPDATE Users SET Interest = Interest + @interest WHERE TelegramId = @id", DbConnection);
+                    updateCmd.Parameters.AddWithValue("@interest", interest + referralBonus);
+                    updateCmd.Parameters.AddWithValue("@id", user.UserId);
+                    await updateCmd.ExecuteNonQueryAsync();
+
+                    await BotClient.SendMessage(
+                        chatId: user.UserId,
+                        text: $"<b>💸 Начислены проценты: {interest:F2} ₽</b>\n\nРеферальный бонус: {referralBonus:F2} ₽",
+                        parseMode: ParseMode.Html,
+                        cancellationToken: CancellationToken.None);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка начисления процентов: {ex}");
+            }
+        }
+
+        private static async Task<Message?> EditOrSendMessageAsync(
+            ITelegramBotClient botClient,
+            long chatId,
+            int messageId,
+            string text,
+            InlineKeyboardMarkup keyboard,
+            CancellationToken cancellationToken,
+            string messageKey,
+            ParseMode parseMode,
+            bool forceNewMessage = false,
+            bool ignoreLastMessageId = false)
+        {
+            try
+            {
+                // Если forceNewMessage или LastMessageIds не содержит ID, отправляем новое сообщение
+                if (forceNewMessage || !LastMessageIds.TryGetValue(chatId, out var lastMessageId) || lastMessageId <= 0)
+                {
+                    Console.WriteLine($"Отправка нового сообщения для {chatId}, key: {messageKey}");
+                    var sentMessage = await botClient.SendMessage(
+                        chatId: chatId,
+                        text: text,
+                        replyMarkup: keyboard,
+                        parseMode: parseMode,
+                        cancellationToken: cancellationToken);
+
+                    if (!ignoreLastMessageId)
+                    {
+                        LastMessageIds[chatId] = sentMessage.MessageId;
+                        Console.WriteLine($"Сохранён новый MessageId: {sentMessage.MessageId} для {chatId}");
+                    }
+                    return sentMessage; // Возвращаем отправленное сообщение
+                }
+
+                // Пытаемся редактировать существующее сообщение
+                Console.WriteLine($"Редактирование сообщения {lastMessageId} для {chatId}, key: {messageKey}");
+                try
+                {
+                    var editedMessage = await botClient.EditMessageText(
+                        chatId: chatId,
+                        messageId: lastMessageId,
+                        text: text,
+                        replyMarkup: keyboard,
+                        parseMode: parseMode,
+                        cancellationToken: cancellationToken);
+                    Console.WriteLine($"Успешно отредактировано сообщение {lastMessageId} для {chatId}");
+                    return editedMessage; // Возвращаем отредактированное сообщение
+                }
+                catch (Exception ex) when (ex.Message.Contains("message is not modified"))
+                {
+                    Console.WriteLine($"Сообщение {lastMessageId} для {chatId} не изменено, пропускаем редактирование, key: {messageKey}");
+                    // Для balance и main_menu сообщение уже актуально, возвращаем null
+                    if (messageKey == "balance" || messageKey == "main_menu")
+                    {
+                        return null; // Сообщение актуально, редактирование не требуется
+                    }
+                    // Для других случаев пробуем исходный messageId
+                    Console.WriteLine($"Повторное редактирование с messageId {messageId} для {chatId}");
+                    try
+                    {
+                        var editedMessage = await botClient.EditMessageText(
+                            chatId: chatId,
+                            messageId: messageId,
+                            text: text,
+                            replyMarkup: keyboard,
+                            parseMode: parseMode,
+                            cancellationToken: cancellationToken);
+                        LastMessageIds[chatId] = messageId;
+                        Console.WriteLine($"Сохранён MessageId после повторного редактирования: {messageId} для {chatId}");
+                        return editedMessage; // Возвращаем отредактированное сообщение
+                    }
+                    catch (Exception ex2)
+                    {
+                        Console.WriteLine($"Ошибка повторного редактирования сообщения {messageId} для {chatId}: {ex2.Message}");
+                        // Отправляем новое сообщение
+                        var sentMessage = await botClient.SendMessage(
+                            chatId: chatId,
+                            text: text,
+                            replyMarkup: keyboard,
+                            parseMode: parseMode,
+                            cancellationToken: cancellationToken);
+                        if (!ignoreLastMessageId)
+                        {
+                            LastMessageIds[chatId] = sentMessage.MessageId;
+                            Console.WriteLine($"Сохранён новый MessageId после ошибки: {sentMessage.MessageId} для {chatId}");
+                        }
+                        return sentMessage; // Возвращаем новое сообщение
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Ошибка редактирования сообщения {lastMessageId} для {chatId}: {ex.Message}");
+                    // Пробуем исходный messageId
+                    try
+                    {
+                        Console.WriteLine($"Повторное редактирование с messageId {messageId} для {chatId}");
+                        var editedMessage = await botClient.EditMessageText(
+                            chatId: chatId,
+                            messageId: messageId,
+                            text: text,
+                            replyMarkup: keyboard,
+                            parseMode: parseMode,
+                            cancellationToken: cancellationToken);
+                        LastMessageIds[chatId] = messageId;
+                        Console.WriteLine($"Сохранён MessageId после повторного редактирования: {messageId} для {chatId}");
+                        return editedMessage; // Возвращаем отредактированное сообщение
+                    }
+                    catch (Exception ex2)
+                    {
+                        Console.WriteLine($"Ошибка повторного редактирования сообщения {messageId} для {chatId}: {ex2.Message}");
+                        // Отправляем новое сообщение
+                        var sentMessage = await botClient.SendMessage(
+                            chatId: chatId,
+                            text: text,
+                            replyMarkup: keyboard,
+                            parseMode: parseMode,
+                            cancellationToken: cancellationToken);
+                        if (!ignoreLastMessageId)
+                        {
+                            LastMessageIds[chatId] = sentMessage.MessageId;
+                            Console.WriteLine($"Сохранён новый MessageId после ошибки: {sentMessage.MessageId} для {chatId}");
+                        }
+                        return sentMessage; // Возвращаем новое сообщение
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Критическая ошибка отправки/редактирования сообщения ({messageKey}): {ex}");
+                var sentMessage = await botClient.SendMessage(
+                    chatId: chatId,
+                    text: "<b>⚠ Произошла ошибка. Попробуйте снова.</b>",
+                    parseMode: ParseMode.Html,
+                    replyMarkup: new InlineKeyboardMarkup(InlineKeyboardButton.WithCallbackData("🔙 В главное меню", "main_menu")),
+                    cancellationToken: cancellationToken);
+                if (!ignoreLastMessageId)
+                {
+                    LastMessageIds[chatId] = sentMessage.MessageId;
+                    Console.WriteLine($"Сохранён новый MessageId после критической ошибки: {sentMessage.MessageId} для {chatId}");
+                }
+                return sentMessage; // Возвращаем сообщение об ошибке
+            }
+        }
+        private static string HtmlEscape(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return text;
+            return text.Replace("&", "&amp;")
+                      .Replace("<", "&lt;")
+                      .Replace(">", "&gt;")
+                      .Replace("\"", "&quot;");
+        }
+
+        private static Task HandleErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken cancellationToken)
+        {
+            Console.WriteLine($"Ошибка в боте: {exception}");
+            return Task.CompletedTask;
+        }
+
+        #endregion
+    }
+
+}
